@@ -1119,3 +1119,506 @@ export function isMediaSizeError(raw: string): boolean {
 6. **收益递减检测**：防止 Token 预算浪费
 7. **弹性恢复**：多层次错误处理，自动重试
 8. **嵌套内存去重**：防止 CLAUDE.md 重复注入
+
+---
+
+## 12. 流式捕捉与工具 Block 完整性判断
+
+### 为什么不需要等待所有 tool_use blocks 接收完毕才开始执行？
+
+**核心机制：StreamingToolExecutor 流式执行器**
+
+传统方式是"批处理模式"：收集所有 tool_use blocks → 全部接收完 → 开始执行。
+
+Claude Code 采用"流式处理模式"：收到一个 tool_use block → 立即入队执行 → 并发安全的工具并行执行。
+
+#### 三层流式处理管道
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 1: API 流式接收 (src/services/api/claude.ts)             │
+│  for await (const part of stream)                               │
+│  - 接收 BetaRawMessageStreamEvent                               │
+│  - 解析 content_block_start/delta/stop                          │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 2: 消息组装 (src/services/api/claude.ts)                 │
+│  - contentBlocks[part.index] 累积状态                           │
+│  - content_block_stop 时生成完整 message                        │
+│  - yield message 给上层                                         │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 3: 工具执行 (src/query.ts + StreamingToolExecutor.ts)    │
+│  - 提取 tool_use blocks                                         │
+│  - addTool() 立即入队执行                                       │
+│  - 不等待所有 blocks 接收完毕                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Layer 1: API 原始流式事件
+
+Anthropic API 返回的事件类型：
+
+| 事件类型 | 说明 |
+|----------|------|
+| `message_start` | 消息开始，包含初始 usage |
+| `content_block_start` | 内容块开始（text/tool_use/thinking） |
+| `content_block_delta` | 内容增量数据 |
+| `content_block_stop` | 内容块结束 |
+| `message_delta` | 消息结束，包含最终 usage |
+| `message_stop` | 消息流结束 |
+
+#### Layer 2: 完整 tool_use block 的判断逻辑
+
+**关键数据结构**（`claude.ts:1975`）：
+
+```typescript
+const contentBlocks: Record<number, BetaContentBlock> = {}
+```
+
+**`part.index`** 是关键：每个 content block 有唯一的索引号，API 按顺序发送事件。
+
+**三阶段捕捉流程**：
+
+**阶段 1: `content_block_start` — block 开始**
+
+```typescript
+// claude.ts:1995-2010
+case 'content_block_start':
+  switch (part.content_block.type) {
+    case 'tool_use':
+      contentBlocks[part.index] = {
+        ...part.content_block,
+        input: '',  // ← 初始化为空字符串
+      }
+      break
+  }
+```
+
+**此时已知**：
+- `block.id` — 工具调用的唯一标识
+- `block.name` — 工具名称（如 `FileReadTool`）
+- `block.type` — 固定为 `'tool_use'`
+- `part.index` — 用于后续 delta 事件的索引
+
+**此时未知**：
+- `block.input` — 参数内容，需要后续 delta 累积
+
+---
+
+**阶段 2: `content_block_delta` — 累积 input**
+
+```typescript
+// claude.ts:2050-2080
+case 'content_block_delta': {
+  const contentBlock = contentBlocks[part.index]
+  if (!contentBlock) {
+    throw new RangeError('Content block not found')
+  }
+  
+  if (contentBlock.type === 'tool_use') {
+    // ← 关键：累积 input 字符串
+    contentBlock.input += part.delta.partial_json
+  }
+  break
+}
+```
+
+**API 流式发送示例**：
+
+```
+event: content_block_start
+data: {"index":0,"content_block":{"type":"tool_use","id":"toolu_abc123","name":"FileReadTool"}}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"\"src/main.ts\"}"}}
+
+event: content_block_stop
+data: {"index":0}
+```
+
+**累积过程**：
+```
+初始: input = ''
+delta1: input += '{"path":'          → '{"path":'
+delta2: input += '"src/main.ts"}'    → '{"path":"src/main.ts"}'
+```
+
+---
+
+**阶段 3: `content_block_stop` — block 完成**
+
+```typescript
+// claude.ts:2171-2200
+case 'content_block_stop': {
+  const contentBlock = contentBlocks[part.index]
+  if (!contentBlock) {
+    throw new RangeError('Content block not found')
+  }
+  
+  // ← 关键：此时 input 已完整累积
+  // 解析 JSON 字符串为对象
+  if (contentBlock.type === 'tool_use') {
+    contentBlock.input = JSON.parse(contentBlock.input)
+  }
+  
+  // 生成完整的 assistant message
+  const m: AssistantMessage = {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [contentBlock],  // ← 完整的 tool_use block
+    },
+    uuid: randomUUID(),
+    timestamp: new Date().toISOString(),
+  }
+  
+  newMessages.push(m)
+  yield m  // ← yield 给上层
+  break
+}
+```
+
+**判断完整的条件**：
+1. 收到 `content_block_stop` 事件
+2. `contentBlocks[part.index]` 存在
+3. `input` 字符串已成功解析为 JSON 对象
+
+---
+
+#### Layer 3: 立即执行工具
+
+**query.ts 中的流式处理**（`query.ts:708-850`）：
+
+```typescript
+for await (const message of deps.callModel({...})) {
+  // message 是完整的 assistant message
+  
+  if (message.type === 'assistant') {
+    // 提取所有 tool_use blocks
+    const msgToolUseBlocks = message.message.content.filter(
+      (c): c is ToolUseBlock => c.type === 'tool_use',
+    )
+    
+    // ← 关键：立即添加到执行器，不等待更多 blocks
+    if (streamingToolExecutor && !toolUseContext.abortController.signal.aborted) {
+      for (const toolBlock of msgToolUseBlocks) {
+        streamingToolExecutor.addTool(toolBlock, message)
+      }
+    }
+  }
+  
+  // 同时检查是否有已完成的工具结果
+  if (streamingToolExecutor) {
+    for (const result of streamingToolExecutor.getCompletedResults()) {
+      yield result.message  // ← 立即 yield 给用户
+    }
+  }
+}
+```
+
+**addTool() 方法**（`StreamingToolExecutor.ts:71-98`）：
+
+```typescript
+addTool(block: ToolUseBlock, assistantMessage: AssistantMessage): void {
+  const tool = findToolByName(this.tools, block.name)
+  const isConcurrencySafe = tool?.isConcurrencySafe ?? false
+  
+  this.tools.push({
+    id: block.id,
+    block,
+    assistantMessage,
+    status: 'queued',      // ← 初始状态：排队中
+    isConcurrencySafe,
+  })
+  
+  // ← 关键：添加工具后立即尝试处理队列
+  void this.processQueue()
+}
+```
+
+**processQueue()**（`StreamingToolExecutor.ts:100-127`）：
+
+```typescript
+private async processQueue(): Promise<void> {
+  if (this.processing) return  // 防止重入
+  
+  try {
+    this.processing = true
+    
+    while (this.hasQueuedTools() && this.canExecuteTool()) {
+      const tool = this.tools.find(t => t.status === 'queued')!
+      tool.status = 'executing'
+      
+      // ← 启动执行，不等待完成
+      tool.promise = this.executeTool(tool)
+        .catch(() => {})
+        .finally(() => {
+          tool.status = 'completed'
+          this.notifyCompletion()  // ← 通知有结果了
+        })
+    }
+  } finally {
+    this.processing = false
+  }
+}
+```
+
+**并发控制逻辑**（`StreamingToolExecutor.ts:139-147`）：
+
+```typescript
+private canExecuteTool(isConcurrencySafe: boolean): boolean {
+  const executingTools = this.tools.filter(t => t.status === 'executing')
+  return (
+    executingTools.length === 0 ||  // 无执行中工具
+    // 或：新工具是并发安全的，且所有执行中工具也都是并发安全的
+    (isConcurrencySafe && executingTools.every(t => t.isConcurrencySafe))
+  )
+}
+```
+
+---
+
+### 完整数据流示例
+
+**场景**：用户提问"帮我搜索代码库中包含 'hello' 的文件，并读取 main.ts 的内容"
+
+#### API 原始事件流
+
+```typescript
+// t0: message_start
+{ type: "message_start", message: { id: "msg_abc123", ... } }
+
+// t1: content_block_start (GrepTool)
+{ type: "content_block_start", index: 0, 
+  content_block: { type: "tool_use", id: "toolu_001", name: "GrepTool", input: {} } }
+
+// t2-t5: content_block_delta (累积 input)
+{ type: "content_block_delta", index: 0, 
+  delta: { type: "input_json_delta", partial_json: "{\"pattern\":\"hello\"}" } }
+
+// t6: content_block_stop (GrepTool 完成)
+{ type: "content_block_stop", index: 0 }
+// → JSON.parse() → yield message #1
+
+// t7: content_block_start (FileReadTool)
+{ type: "content_block_start", index: 1,
+  content_block: { type: "tool_use", id: "toolu_002", name: "FileReadTool", input: {} } }
+
+// t8-t9: content_block_delta
+{ type: "content_block_delta", index: 1,
+  delta: { type: "input_json_delta", partial_json: "{\"path\":\"src/main.ts\"}" } }
+
+// t10: content_block_stop (FileReadTool 完成)
+{ type: "content_block_stop", index: 1 }
+// → JSON.parse() → yield message #2
+
+// t11-t12: message_delta + message_stop
+```
+
+#### Layer 2 yield 的完整 message
+
+```typescript
+// t6: yield message #1 (GrepTool)
+{
+  type: "assistant",
+  message: {
+    role: "assistant",
+    content: [{
+      type: "tool_use",
+      id: "toolu_001",
+      name: "GrepTool",
+      input: { pattern: "hello", path: ".", include: "*.ts" }
+    }]
+  },
+  uuid: "550e8400-e29b-41d4-a716-446655440001",
+  timestamp: "2026-04-03T10:15:30.123Z"
+}
+
+// t10: yield message #2 (FileReadTool)
+{
+  type: "assistant",
+  message: {
+    role: "assistant",
+    content: [{
+      type: "tool_use",
+      id: "toolu_002",
+      name: "FileReadTool",
+      input: { path: "src/main.ts" }
+    }]
+  },
+  uuid: "550e8400-e29b-41d4-a716-446655440002",
+  timestamp: "2026-04-03T10:15:30.456Z"
+}
+```
+
+#### Layer 3 工具执行状态
+
+```typescript
+// t6: addTool(GrepTool) 后
+tools = [{
+  id: "toolu_001",
+  block: { name: "GrepTool", input: {...} },
+  status: "executing",      // 立即开始执行
+  isConcurrencySafe: true,
+  promise: Promise<GrepTool 执行结果>
+}]
+
+// t10: addTool(FileReadTool) 后
+tools = [
+  { id: "toolu_001", status: "executing", isConcurrencySafe: true, ... },
+  { id: "toolu_002", status: "executing", isConcurrencySafe: true, ... }  // 并行执行
+]
+```
+
+#### Layer 4 工具执行结果
+
+```typescript
+// t15: GrepTool 完成
+{
+  message: {
+    type: "user",
+    content: [{
+      type: "tool_result",
+      tool_use_id: "toolu_001",
+      content: [{ type: "text", text: "Found 3 matches:\n- src/main.ts:42\n..." }],
+      is_error: false
+    }],
+    toolUseResult: "GrepTool 执行成功"
+  }
+}
+
+// t18: FileReadTool 完成
+{
+  message: {
+    type: "user",
+    content: [{
+      type: "tool_result",
+      tool_use_id: "toolu_002",
+      content: [{ type: "text", text: "console.log('hello world');\n// ..." }],
+      is_error: false
+    }],
+    toolUseResult: "FileReadTool 执行成功"
+  }
+}
+```
+
+---
+
+### 完整时序图
+
+```
+时间 →
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ Layer 1: API 原始事件                                               │
+│                                                                     │
+│  t0:  message_start                                                 │
+│  t1:  content_block_start (index=0, GrepTool)                       │
+│  t2:  content_block_delta (partial_json: '{"pattern":')             │
+│  t3:  content_block_delta (partial_json: '"hello",')                │
+│  t4:  content_block_delta (partial_json: '"path":".","')            │
+│  t5:  content_block_delta (partial_json: '"include":"*.ts"}')       │
+│  t6:  content_block_stop (index=0)  ← GrepTool block 完整           │
+│  t7:  content_block_start (index=1, FileReadTool)                   │
+│  t8:  content_block_delta (partial_json: '{"path":')                │
+│  t9:  content_block_delta (partial_json: '"src/main.ts"}')          │
+│  t10: content_block_stop (index=1)  ← FileReadTool block 完整       │
+│  t11: message_delta                                                 │
+│  t12: message_stop                                                  │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓ yield
+┌─────────────────────────────────────────────────────────────────────┐
+│ Layer 2: claude.ts 组装的完整 message                                │
+│                                                                     │
+│  t6:  yield message #1 (GrepTool)                                   │
+│       { type: "assistant",                                          │
+│         message: { content: [{ type: "tool_use", id: "toolu_001"...}]}} │
+│                                                                     │
+│  t10: yield message #2 (FileReadTool)                               │
+│       { type: "assistant",                                          │
+│         message: { content: [{ type: "tool_use", id: "toolu_002"...}]}} │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓ 提取 + 执行
+┌─────────────────────────────────────────────────────────────────────┐
+│ Layer 3: query.ts + StreamingToolExecutor                           │
+│                                                                     │
+│  t6:  addTool(GrepTool) → status: "executing"                       │
+│       GrepTool 开始执行                                             │
+│                                                                     │
+│  t10: addTool(FileReadTool) → status: "executing"                   │
+│       FileReadTool 开始执行 (与 GrepTool 并行)                        │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓ 结果返回
+┌─────────────────────────────────────────────────────────────────────┐
+│ Layer 4: 工具执行结果 (yield 给用户)                                  │
+│                                                                     │
+│  t15: GrepTool 完成 → yield tool_result #1                          │
+│       { type: "user", content: [{ tool_result: "Found 3 matches..." }] } │
+│                                                                     │
+│  t18: FileReadTool 完成 → yield tool_result #2                      │
+│       { type: "user", content: [{ tool_result: "console.log..." }] }   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 关键设计要点
+
+| 设计点 | 实现方式 |
+|--------|----------|
+| **block 唯一标识** | `part.index` + `block.id` |
+| **增量累积** | `contentBlocks[part.index].input += part.delta.partial_json` |
+| **完成判断** | `content_block_stop` 事件 + JSON 解析成功 |
+| **立即执行** | `addTool()` 调用 `processQueue()` |
+| **并发控制** | `isConcurrencySafe` 标记 + `canExecuteTool()` 检查 |
+| **资源清理** | `contentBlocks` 在每次 API 调用后重置 |
+
+---
+
+### 容错处理
+
+**JSON 解析失败**（`claude.ts:2185-2195`）：
+
+```typescript
+try {
+  contentBlock.input = JSON.parse(contentBlock.input)
+} catch (e) {
+  logEvent('tengu_streaming_error', {
+    error_type: 'tool_input_json_parse_failed',
+    tool_name: contentBlock.name,
+    tool_input: contentBlock.input,  // 记录原始字符串用于调试
+  })
+  throw e
+}
+```
+
+**streaming fallback**（`query.ts:910-920`）：
+
+如果流式过程中出错（如网络中断）：
+
+```typescript
+if (streamingToolExecutor) {
+  streamingToolExecutor.discard()  // 丢弃未完成的任务
+  streamingToolExecutor = new StreamingToolExecutor(...)  // 创建新的执行器
+}
+// 切换到非流式模式重试
+```
+
+---
+
+### 核心优势对比
+
+| 传统方式 | 流式执行 |
+|----------|----------|
+| 收集所有 `tool_use` blocks | 收到一个处理一个 |
+| 全部接收完才开始执行 | 并发安全的工具立即并行执行 |
+| 串行执行所有工具 | 并发安全工具并行，不安全工具串行 |
+| 用户等待时间长 | 用户尽早看到部分结果 |
+
+**核心思想**：将工具执行从"批处理模式"改为"流式处理模式"，利用并发安全工具的并行能力，减少用户等待时间。
