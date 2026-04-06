@@ -399,6 +399,112 @@ export function adjustIndexToPreserveAPIInvariants(
 }
 ```
 
+### 4.7 关键区别：最近的消息是否发送给大模型？
+
+**问题场景：** 假设当前已对话 10 轮，需要压缩。是把 10 轮都发给大模型，还是只发前 8 轮，后 2 轮直接保留？
+
+**答案：取决于压缩模式。**
+
+#### Session Memory Compact：只发前 8 轮，后 2 轮直接保留（且不调用大模型）
+
+Session Memory Compact **不会调用大模型**，而是：
+
+1. 使用 `lastSummarizedMessageId` 确定边界（例如第 8 轮结束）
+2. **前 8 轮**：使用已有的 session memory 内容作为摘要（不调用大模型）
+3. **后 2 轮**：直接保留原样（`messagesToKeep = messages.slice(startIndex)`）
+
+```typescript
+// src/services/compact/sessionMemoryCompact.ts:558
+const lastSummarizedIndex = messages.findIndex(
+  msg => msg.uuid === lastSummarizedMessageId,
+)
+
+// src/services/compact/sessionMemoryCompact.ts:578
+const startIndex = calculateMessagesToKeepIndex(messages, lastSummarizedIndex)
+
+// src/services/compact/sessionMemoryCompact.ts:585
+const messagesToKeep = messages
+  .slice(startIndex)
+  .filter(m => !isCompactBoundaryMessage(m))
+```
+
+**消息流向：**
+
+```
+完整 10 轮对话：
+├── [第 1-8 轮] ← lastSummarizedMessageId 之前
+└── [第 9-10 轮] ← lastSummarizedMessageId 之后（保留）
+
+Session Memory Compact 处理：
+├── [第 1-8 轮] → 用 session memory 替换（不调用大模型）
+└── [第 9-10 轮] → 直接保留
+
+压缩后上下文：
+├── compact_boundary 系统消息
+├── summaryMessages（session memory 内容）
+└── messagesToKeep（第 9-10 轮原样保留）
+```
+
+**关键点：**
+- ❌ **不调用大模型**
+- ✅ **后 2 轮直接保留**，不经过任何处理
+- ✅ **前 8 轮用 session memory 替换**，不是大模型生成的
+
+#### Full Compact：10 轮全部发送给大模型
+
+Full Compact **会调用大模型**，并且：
+
+1. **所有 10 轮**都传递给 `runForkedAgent`
+2. 大模型看到完整历史，生成覆盖所有 10 轮的摘要
+3. 摘要替换所有历史，不保留任何原始消息
+
+```typescript
+// src/services/compact/compact.ts:448
+let messagesToSummarize = messages  // 所有消息
+
+// src/utils/forkedAgent.ts:524
+const initialMessages: Message[] = [...forkContextMessages, ...promptMessages]
+// forkContextMessages = 完整 10 轮对话
+```
+
+**消息流向：**
+
+```
+完整 10 轮对话：
+├── [第 1-8 轮]
+└── [第 9-10 轮]
+
+Full Compact 处理：
+├── [全部 10 轮] → 发送给大模型
+└── 大模型生成摘要 → 替换所有历史
+
+压缩后上下文：
+├── compact_boundary 系统消息
+├── summaryMessages（大模型生成的摘要，覆盖 10 轮）
+└── postCompactFileAttachments（重新读取的最近文件）
+```
+
+**关键点：**
+- ✅ **调用大模型**
+- ✅ **10 轮全部发送**给大模型
+- ❌ **不保留任何原始消息**，全部用摘要替换
+- ✅ **后压缩文件恢复**：重新读取最近文件（最多 5 个）作为附件
+
+#### 对比总结
+
+| 问题 | Session Memory Compact | Full Compact |
+|------|----------------------|--------------|
+| 是否调用大模型 | ❌ 不会 | ✅ 会 |
+| 10 轮全部发送？ | ❌ 只发送 session memory（前 8 轮的摘要） | ✅ 全部 10 轮 |
+| 后 2 轮保留？ | ✅ 直接保留原样 | ❌ 用摘要替换 |
+| 前 8 轮处理 | 用 session memory 替换 | 大模型生成摘要覆盖 |
+| 隐私性 | 更高（最近消息不发送给大模型） | 较低（所有消息都发送） |
+| API 成本 | 零 | 有（尽管有缓存命中） |
+
+---
+
+### 4.8 API 不变量保护
+
 ---
 
 ## 5. Full Compact（完整压缩）
@@ -726,6 +832,168 @@ Summary:
 
 ---
 
+### 5.7 缓存命中机制详解
+
+#### 5.7.1 核心设计原则
+
+**Full Compact 为了缓存命中，保持了所有缓存关键参数不变，只是在消息列表末尾追加了一个压缩请求消息。**
+
+实际发送给 API 的消息结构：
+
+```typescript
+// src/utils/forkedAgent.ts:534
+const initialMessages: Message[] = [...forkContextMessages, ...promptMessages]
+```
+
+**消息序列分解：**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ forkContextMessages（来自主对话，已缓存）                   │
+│ ├── Message 1: user "帮我写个 Python 脚本..."                │
+│ ├── Message 2: assistant "好的，我来帮你..."                │
+│ ├── Message 3: user "运行一下看看..."                       │
+│ ├── Message 4: assistant [tool_use] + [tool_result]         │
+│ └── ...（完整的历史对话）                                   │
+├─────────────────────────────────────────────────────────────┤
+│ promptMessages（新增的压缩请求）                            │
+│ └── Message N+1: user [BASE_COMPACT_PROMPT]                 │
+│         "Your task is to create a detailed summary..."      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 5.7.2 Anthropic Prompt Cache 缓存键组成
+
+根据 `forkedAgent.ts` 的注释：
+
+> The Anthropic API cache key is composed of: **system prompt**, **tools**, **model**, **messages (prefix)**, and **thinking config**.
+
+**CacheSafeParams 保证缓存命中：**
+
+```typescript
+type CacheSafeParams = {
+  systemPrompt: SystemPrompt           // ✓ 系统提示词 - 保持不变
+  userContext: { [k: string]: string } // ✓ 用户上下文 - 保持不变
+  systemContext: { [k: string]: string } // ✓ 系统上下文 - 保持不变
+  toolUseContext: ToolUseContext       // ✓ 工具定义 + 模型 + thinking 配置
+  forkContextMessages: Message[]       // ✓ 消息前缀 - 完整历史
+}
+```
+
+#### 5.7.3 缓存命中原理
+
+```
+主对话请求时的消息序列：
+┌──────────────────────────────────────┐
+│ M1, M2, M3, M4, ... M(n-1)          │ → 已缓存
+└──────────────────────────────────────┘
+
+压缩时的消息序列：
+┌──────────────────────────────────────┬─────────────────┐
+│ M1, M2, M3, M4, ... M(n-1)          │ │ M(n): 压缩请求 │
+│ ↑                                    │ │               │
+│ └────── 完全相同，命中缓存 ──────────┘ └── 新增部分 ───┘
+```
+
+**Anthropic 的缓存机制：**
+- 缓存键基于**消息前缀**
+- 当前缀匹配时，前缀部分的 `cache_read_input_tokens` 命中
+- 只有新增的消息部分需要重新计算
+
+#### 5.7.4 成本对比
+
+根据代码中的实验数据：
+
+```typescript
+// Experiment (Jan 2026) confirmed:
+// false path is 98% cache miss, costs ~0.76% of fleet cache_creation
+// (~38B tok/day)
+```
+
+| 模式 | 缓存命中率 | 主要支付项 | 成本 |
+|------|-----------|-----------|------|
+| **启用缓存共享** | ~98% | `cache_read_input_tokens` | 低 |
+| **不启用缓存共享** | ~2% | `cache_creation_input_tokens` + `input_tokens` | 高 |
+
+**数据影响：** 不启用缓存共享会消耗约 0.76% 的全队缓存创建量（约 38B tokens/天），主要集中在 ephemeral 环境（CCR/GHA/SDK）中使用冷 GB 缓存和禁用 GB 的第三方提供商。
+
+#### 5.7.5 关键设计细节
+
+```typescript
+// src/services/compact/compact.ts:1157
+const result = await runForkedAgent({
+  promptMessages: [summaryRequest],  // 只传压缩请求
+  cacheSafeParams,                   // 继承主对话的完整上下文
+  canUseTool: createCompactCanUseTool(), // 禁用工具
+  maxTurns: 1,                       // 只允许一轮
+  skipCacheWrite: true,              // 不写入新缓存（避免污染）
+})
+```
+
+**为什么 `skipCacheWrite: true`？**
+- 压缩是"一次性"操作，生成的摘要会插入到主对话中
+- 如果写入缓存，会污染主对话的缓存前缀
+- 未来的主对话请求不需要以压缩请求为前缀
+
+**为什么不能设置 `maxOutputTokens`？**
+
+```typescript
+// src/services/compact/compact.ts:1150
+// DO NOT set maxOutputTokens here. The fork piggybacks on the main thread's
+// prompt cache by sending identical cache-key params (system, tools, model,
+// messages prefix, thinking config). Setting maxOutputTokens would clamp
+// budget_tokens via Math.min(budget, maxOutputTokens-1) in claude.ts,
+// creating a thinking config mismatch that invalidates the cache.
+```
+
+设置 `maxOutputTokens` 会通过 `claude.ts` 中的 `Math.min(budget, maxOutputTokens-1)` 影响 `budget_tokens`，导致 thinking 配置不匹配从而使缓存失效。
+
+#### 5.7.6 缓存参数传递流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 主对话 Query Loop                                           │
+│ - 构建 CacheSafeParams                                      │
+│ - systemPrompt, userContext, systemContext                  │
+│ - toolUseContext (tools, model, thinking config)            │
+│ - forkContextMessages (完整历史)                            │
+└─────────────────────────────────────────────────────────────┘
+                            ↓ saveCacheSafeParams()
+┌─────────────────────────────────────────────────────────────┐
+│ CompactConversation                                         │
+│ - 接收 cacheSafeParams 参数                                 │
+│ - 传递给 streamCompactSummary()                             │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ runForkedAgent                                              │
+│ - 使用 cacheSafeParams 构建 initialMessages                 │
+│ - initialMessages = [...forkContextMessages, ...prompt]     │
+│ - 调用 query() 执行                                         │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Anthropic API                                               │
+│ - 消息前缀匹配 → cache hit                                  │
+│ - 仅压缩请求部分需要新计算                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 5.7.7 总结：缓存命中设计要点
+
+| 组件 | 是否改变 | 说明 |
+|------|---------|------|
+| 系统提示词 | ❌ 不变 | 直接继承 |
+| 工具定义 | ❌ 不变 | 从 toolUseContext 继承 |
+| 模型 | ❌ 不变 | 从 toolUseContext 继承 |
+| 消息前缀 | ❌ 不变 | forkContextMessages 是完整历史 |
+| Thinking 配置 | ❌ 不变 | 从 toolUseContext 继承 |
+| 最新消息 | ✅ 新增 | 压缩请求提示词 |
+
+**本质：** Full Compact 是在主对话的**完整历史副本**上，追加一条"请总结上述对话"的指令，然后调用模型。由于前缀完全相同，所以能实现 ~98% 的缓存命中率。
+
+---
+
 ## 6. 压缩结果与后续处理
 
 ### 6.1 CompactionResult 结构
@@ -889,6 +1157,155 @@ logEvent('tengu_compact', {
 3. 跳过 preservedMessages 中已有的内容
 4. 受 token 预算限制
 
+### 9.6 压缩后内容保护机制（核心）
+
+**用户关心的问题：** 压缩后，之前读取的文件内容会不会丢失？如果丢失了，后面再问这个文件的内容，模型还能回答吗？
+
+**答案：** Claude Code 通过多层机制确保核心内容不丢失。
+
+#### 9.6.1 保护机制总览
+
+| 机制 | 保护内容 | 保护方式 | 局限性 |
+|------|---------|---------|--------|
+| **压缩提示词要求** | 文件名、关键代码片段 | 要求模型在摘要中记录 | 有损压缩，不完整 |
+| **后压缩文件恢复** | 最近访问的文件内容 | 重新读取文件（最多 5 个，50K tokens） | 受数量和 token 限制 |
+| **保留最近消息** | 最近的对话内容 | Session Memory Compact 保留 10K-40K tokens | 仅 SM Compact 有效 |
+| **API 不变量保护** | tool_use/tool_result 对 | 不拆分相关消息对 | - |
+| **技能附件恢复** | 已激活的技能内容 | 重新附加技能文件（25K tokens） | 仅适用于 skills |
+
+#### 9.6.2 后压缩文件恢复（核心机制）
+
+**这是最关键的保护机制。**
+
+```typescript
+// src/services/compact/compact.ts:122-124
+export const POST_COMPACT_MAX_FILES_TO_RESTORE = 5      // 最多恢复 5 个文件
+export const POST_COMPACT_TOKEN_BUDGET = 50_000         // 总 token 预算 50K
+export const POST_COMPACT_MAX_TOKENS_PER_FILE = 5_000   // 每文件最多 5K tokens
+```
+
+**工作流程：**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 压缩前                                                       │
+│ - readFileState 追踪最近访问的文件                          │
+│   { "src/main.py": { content: "...", timestamp: 123456 } }  │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 压缩执行                                                     │
+│ - 生成摘要（包含文件名的文字描述）                          │
+│ - 丢弃原始 tool_result 中的文件内容                         │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 后压缩文件恢复（关键步骤）                                   │
+│ - 从 readFileState 获取最近 5 个文件                        │
+│ - 使用 FileReadTool 重新读取实际内容                        │
+│ - 创建 attachment 消息附加到压缩后上下文                    │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 压缩后上下文                                                 │
+│ - compact_boundary 系统消息                                 │
+│ - 摘要内容（包含文件名的文字描述）                          │
+│ - [附件] src/main.py (重新读取的完整内容，最多 5K tokens)   │
+│ - [附件] src/utils/helper.py (重新读取的完整内容)           │
+│ - ...最多 5 个文件                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键点：**
+- 文件内容是**重新读取**的，不是从摘要中"恢复"的
+- 保证了内容的**完整性和准确性**
+- 受 token 预算限制（50K 总预算，每文件最多 5K）
+
+#### 9.6.3 压缩提示词要求
+
+**BASE_COMPACT_PROMPT 明确要求：**
+
+```text
+3. Files and Code Sections: Enumerate specific files and code sections examined, 
+   modified, or created. Pay special attention to the most recent messages and 
+   include full code snippets where applicable and include a summary of why this 
+   file read or edit is important.
+```
+
+**示例输出格式：**
+
+```text
+3. Files and Code Sections:
+   - src/main.py
+      - [Summary of why this file is important]
+      - [Summary of the changes made to this file, if any]
+      - [Important Code Snippet]
+```
+
+**局限性：** 摘要中的代码片段是**有损压缩**，不可能保留完整文件内容。
+
+#### 9.6.4 Session Memory Compact 保留最近消息
+
+Session Memory Compact 不会压缩所有消息，而是**保留最近的消息原样**：
+
+```typescript
+// src/services/compact/sessionMemoryCompact.ts
+export const DEFAULT_SM_COMPACT_CONFIG: SessionMemoryCompactConfig = {
+  minTokens: 10_000,      // 压缩后最少保留 10K tokens 的最近消息
+  minTextBlockMessages: 5, // 最少保留 5 条带文本块的消息
+  maxTokens: 40_000,      // 压缩后最多保留 40K tokens
+}
+```
+
+**这意味着：**
+- 最近的对话（包括最近的文件读取）**不会被压缩**
+- 只有较早的历史会被摘要替换
+- 保证了短期上下文的完整性
+
+#### 9.6.5 实际效果示例
+
+**压缩前的上下文：**
+
+```
+User: 帮我读取 src/main.py
+Assistant: [tool_use: Read src/main.py]
+User: [tool_result: <file_content>...]
+User: 现在帮我修改这个文件...
+Assistant: [tool_use: Edit src/main.py]
+...（多轮对话后，token 接近限制）
+```
+
+**压缩后的上下文：**
+
+```
+System: [compact_boundary]
+User: Summary:
+      1. Primary Request and Intent: 用户希望修改 src/main.py...
+      2. Key Technical Concepts: Python, FastAPI...
+      3. Files and Code Sections:
+         - src/main.py: 实现了主要的 API 端点...
+         [注意：这里只有文字描述，没有完整内容]
+      ...
+      
+Attachment: [Read: src/main.py]  ← 重新读取的完整内容
+            <actual file content here>
+
+Attachment: [Read: src/utils/helper.py]  ← 另一个最近文件
+            <actual file content here>
+
+User: 继续对话的最近消息...
+Assistant: ...
+```
+
+#### 9.6.6 局限性
+
+| 限制 | 说明 | 影响 |
+|------|------|------|
+| **文件数量限制** | 最多恢复 5 个文件 | 如果读了 10 个文件，只有最近 5 个会被恢复 |
+| **Token 预算限制** | 总共 50K tokens，每文件 5K | 大文件可能被截断或无法全部恢复 |
+| **时间窗口** | 按 timestamp 排序 | 早期读取但重要的文件可能被丢弃 |
+| **摘要有损** | 提示词要求记录代码片段 | 但摘要是文字描述，不是完整代码 |
+
 ---
 
 ## 10. 常见问题与调试
@@ -923,9 +1340,73 @@ logEvent('tengu_compact', {
 2. 调整 Session Memory Compact 的 `maxTokens`
 3. 检查是否有大型文件附件
 
+### 10.4 最近的消息是否发送给大模型？
+
+**问题：** 假设当前已对话 10 轮，需要压缩。是把 10 轮都发给大模型，还是只发前 8 轮，后 2 轮直接保留？
+
+**答案：取决于压缩模式。**
+
+| 问题 | Session Memory Compact | Full Compact |
+|------|----------------------|--------------|
+| 是否调用大模型 | ❌ 不会 | ✅ 会 |
+| 10 轮全部发送？ | ❌ 只发送 session memory（前 8 轮的摘要） | ✅ 全部 10 轮 |
+| 后 2 轮保留？ | ✅ 直接保留原样 | ❌ 用摘要替换 |
+| 前 8 轮处理 | 用 session memory 替换 | 大模型生成摘要覆盖 |
+| 隐私性 | 更高（最近消息不发送给大模型） | 较低（所有消息都发送） |
+| API 成本 | 零 | 有（尽管有缓存命中） |
+
+**Session Memory Compact 消息流向：**
+
+```
+完整 10 轮对话：
+├── [第 1-8 轮] ← lastSummarizedMessageId 之前
+└── [第 9-10 轮] ← lastSummarizedMessageId 之后（保留）
+
+Session Memory Compact 处理：
+├── [第 1-8 轮] → 用 session memory 替换（不调用大模型）
+└── [第 9-10 轮] → 直接保留
+
+压缩后上下文：
+├── compact_boundary 系统消息
+├── summaryMessages（session memory 内容）
+└── messagesToKeep（第 9-10 轮原样保留）
+```
+
+**Full Compact 消息流向：**
+
+```
+完整 10 轮对话：
+├── [第 1-8 轮]
+└── [第 9-10 轮]
+
+Full Compact 处理：
+├── [全部 10 轮] → 发送给大模型
+└── 大模型生成摘要 → 替换所有历史
+
+压缩后上下文：
+├── compact_boundary 系统消息
+├── summaryMessages（大模型生成的摘要，覆盖 10 轮）
+└── postCompactFileAttachments（重新读取的最近文件）
+```
+
+**这意味着：**
+
+1. **Session Memory Compact**：
+   - ❌ 不调用大模型
+   - ✅ 后 2 轮直接保留原样
+   - ✅ 前 8 轮用 session memory 替换
+   - ✅ 更隐私、零 API 成本
+
+2. **Full Compact**：
+   - ✅ 调用大模型
+   - ✅ 10 轮全部发送给大模型
+   - ❌ 所有消息都用摘要替换
+   - ✅ 后压缩文件恢复重新读取最近文件
+   - ❌ 隐私性较低、有 API 成本（尽管有缓存命中）
+
 ---
 
-## 11. 文件路径索引
+## 12. 文件路径索引
 
 | 文件 | 职责 |
 |------|------|
@@ -942,7 +1423,7 @@ logEvent('tengu_compact', {
 
 ---
 
-## 12. 总结
+## 13. 总结
 
 Claude Code 的自动压缩机制是一个**多层、渐进、带保护**的上下文管理系统：
 

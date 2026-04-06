@@ -402,6 +402,392 @@ Agent 通过 `skill_listing` attachment 发现可用技能：
 
 ---
 
+## 深度解析：系统提示词注入机制
+
+### 两阶段内容注入
+
+Skill 系统采用**两阶段注入策略**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    两阶段内容注入                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  阶段 1: 发现阶段 (skill_listing)                                    │
+│  ────────────────────────────────────────────────────────────────── │
+│  注入内容: 仅技能名称 + 简短描述                                      │
+│  格式: "- commit: Create a git commit with staged changes"          │
+│  目的: 让 LLM 知道有哪些技能可用                                     │
+│  Token 成本: 低（限制在 1% context window）                          │
+│                                                                      │
+│  阶段 2: 调用阶段 (getPromptForCommand)                              │
+│  ────────────────────────────────────────────────────────────────── │
+│  注入内容: 技能完整 prompt 模板                                      │
+│  格式: 完整 Markdown 内容（步骤、示例、Shell 命令等）                 │
+│  触发: LLM 调用 SkillTool 时                                         │
+│  Token 成本: 按需加载，只有实际使用的技能才消耗                       │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 为什么这样设计？
+
+| 问题 | 解决方案 |
+|-----|---------|
+| 50+ 技能完整内容会占用大量 token | 初始只注入名称+描述（< 1% context） |
+| LLM 需要知道有哪些技能可用 | skill_listing 提供技能目录 |
+| 完整内容只在调用时才需要 | getPromptForCommand 按需加载 |
+
+### 完整流程示例
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    完整流程示例: /commit 技能                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  [Turn 0] 初始注入                                                   │
+│  ────────────────────────────────────────────────────────────────── │
+│  LLM 收到:                                                           │
+│  <system-reminder>                                                   │
+│  The following skills are available:                                 │
+│  - commit: Create a git commit with staged changes                   │
+│  - review-pr: Review a pull request...                               │
+│  ...                                                                 │
+│  </system-reminder>                                                  │
+│                                                                      │
+│  → LLM 只看到简介，token 消耗低                                       │
+│                                                                      │
+│  [Turn 1] LLM 决定调用 commit 技能                                   │
+│  ────────────────────────────────────────────────────────────────── │
+│  LLM 输出:                                                           │
+│  {                                                                   │
+│    "type": "tool_use",                                               │
+│    "name": "Skill",                                                  │
+│    "input": { "skill": "commit", "args": "fix bug" }                 │
+│  }                                                                   │
+│                                                                      │
+│  [Turn 2] 技能完整内容加载                                           │
+│  ────────────────────────────────────────────────────────────────── │
+│  SkillTool 调用 getPromptForCommand():                               │
+│  - 从内存/文件读取完整 Markdown                                       │
+│  - 执行参数替换、Shell 命令等                                         │
+│  - 返回处理后的完整内容                                               │
+│                                                                      │
+│  注入到对话:                                                         │
+│  <user message isMeta="true">                                        │
+│  Create a git commit with the message: fix bug                       │
+│                                                                      │
+│  Steps:                                                              │
+│  1. Run `git status` to see what changed                             │
+│  2. Run `git diff` to understand the changes                         │
+│  3. Stage relevant files with `git add`                              │
+│  4. Create the commit                                                │
+│                                                                      │
+│  Current branch: main                                                │
+│  Changed files: src/foo.ts, src/bar.ts                               │
+│  </user message>                                                     │
+│                                                                      │
+│  → 完整内容按需加载，只有被调用的技能才消耗 token                      │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### skill_listing Attachment 结构
+
+技能列表通过 `skill_listing` attachment 类型注入到 LLM 上下文中：
+
+```typescript
+// src/utils/attachments.ts
+type Attachment = {
+  type: 'skill_listing'
+  content: string      // 格式化的技能列表
+  skillCount: number   // 技能数量
+  isInitial: boolean   // 是否首次注入（Turn 0）
+}
+```
+
+### 注入流程详解
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    skill_listing 注入流程                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  [1] getAttachments() (attachments.ts:875)                          │
+│      │                                                               │
+│      └─> maybe('skill_listing', () => getSkillListingAttachments()) │
+│                                                                      │
+│  [2] getSkillListingAttachments() (attachments.ts:2661-2751)        │
+│      │                                                               │
+│      ├── getSkillToolCommands(cwd)  // 获取本地技能                  │
+│      ├── getMcpSkillCommands()      // 获取 MCP 技能                 │
+│      ├── sentSkillNames 跟踪        // 避免重复注入                  │
+│      │                                                               │
+│      └── formatCommandsWithinBudget() // 格式化，限制 1% context    │
+│                                                                      │
+│  [3] normalizeAttachmentForAPI() (messages.ts:3728-3738)            │
+│      │                                                               │
+│      └── 转换为 UserMessage，包装在 <system-reminder> 标签中         │
+│                                                                      │
+│  [4] 注入到 API 请求的 messages 数组                                 │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 最终格式（发送给 LLM 的内容）
+
+```xml
+<system-reminder>
+The following skills are available for use with the Skill tool:
+
+- commit: Create a git commit with staged changes
+- review-pr: Review a pull request for quality
+- doctor: Run diagnostic checks on your environment
+- remember: Store information across sessions
+- mcp: Manage MCP servers and tools
+...
+</system-reminder>
+```
+
+**关键特性**：
+
+| 特性 | 实现 | 效果 |
+|-----|-----|-----|
+| **去重** | `sentSkillNames` Map 跟踪已发送技能 | 避免重复注入 |
+| **Delta 更新** | 后续只注入新增技能 | 节省 context |
+| **预算限制** | 1% context window，单条描述最多 250 字符 | 控制 token 消耗 |
+| **优先级** | Bundled 技能优先保留完整描述 | 保证核心技能可见 |
+
+### 关键代码
+
+```typescript
+// src/utils/attachments.ts:2661-2751
+async function getSkillListingAttachments(
+  toolUseContext: ToolUseContext,
+): Promise<Attachment[]> {
+  const cwd = getProjectRoot()
+  const localCommands = await getSkillToolCommands(cwd)
+  const mcpSkills = getMcpSkillCommands(toolUseContext.getAppState().mcp.commands)
+
+  // 跟踪已发送的技能
+  let sent = sentSkillNames.get(agentKey)
+  if (!sent) {
+    sent = new Set()
+    sentSkillNames.set(agentKey, sent)
+  }
+
+  // 只发送新增的技能
+  const newSkills = allCommands.filter(cmd => !sent.has(cmd.name))
+  const isInitial = sent.size === 0  // 首次注入标记
+
+  for (const cmd of newSkills) {
+    sent.add(cmd.name)
+  }
+
+  // 格式化并返回
+  const content = formatCommandsWithinBudget(newSkills, contextWindowTokens)
+  return [{ type: 'skill_listing', content, skillCount: newSkills.length, isInitial }]
+}
+```
+
+---
+
+## 深度解析：内容按需加载机制
+
+### 不同技能类型的加载时机
+
+| 技能类型 | 内容加载时机 | 懒加载元素 |
+|---------|------------|-----------|
+| 文件技能 (`/skills/`) | **发现时** - 读取文件 | Shell 命令在调用时执行 |
+| Bundled 简单 | 编译时内联 | Shell 命令在调用时执行 |
+| Bundled 重型 (如 `/claude-api`) | **调用时** - 动态 import | 整个内容模块懒加载 |
+| Built-in (如 `/insights`) | **调用时** - lazy shim | 整个命令模块懒加载 |
+
+### getPromptForCommand() 处理流程
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    getPromptForCommand() 处理流程                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  输入: args = "fix bug", skill markdown content                     │
+│                                                                      │
+│  [1] 参数替换 (substituteArguments)                                  │
+│      ├── $ARGUMENTS → "fix bug"                                     │
+│      ├── $ARGUMENTS[0] → "fix"                                      │
+│      └── 命名参数 $message → "fix bug"                              │
+│                                                                      │
+│  [2] 变量替换                                                        │
+│      ├── ${CLAUDE_SKILL_DIR} → /path/to/skill                       │
+│      └── ${CLAUDE_SESSION_ID} → session-uuid                        │
+│                                                                      │
+│  [3] Shell 命令执行 (executeShellCommandsInPrompt)                  │
+│      └── !`git status` → 实际执行并替换结果                          │
+│                                                                      │
+│  输出: ContentBlockParam[] = [{ type: 'text', text: finalContent }] │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 关键代码：createSkillCommand
+
+```typescript
+// src/skills/loadSkillsDir.ts:344-398
+export function createSkillCommand({
+  skillName,
+  markdownContent,  // 发现时已读取
+  baseDir,
+  argumentNames,
+  ...
+}): Command {
+  return {
+    type: 'prompt',
+    name: skillName,
+    contentLength: markdownContent.length,
+    async getPromptForCommand(args, toolUseContext) {
+      // 1. 基础目录头部
+      let finalContent = baseDir
+        ? `Base directory for this skill: ${baseDir}\n\n${markdownContent}`
+        : markdownContent
+
+      // 2. 参数替换
+      finalContent = substituteArguments(finalContent, args, true, argumentNames)
+
+      // 3. 变量替换
+      if (baseDir) {
+        finalContent = finalContent.replace(/\$\{CLAUDE_SKILL_DIR\}/g, skillDir)
+      }
+      finalContent = finalContent.replace(/\$\{CLAUDE_SESSION_ID\}/g, getSessionId())
+
+      // 4. Shell 命令执行
+      finalContent = await executeShellCommandsInPrompt(finalContent, toolUseContext, ...)
+
+      return [{ type: 'text', text: finalContent }]
+    },
+  }
+}
+```
+
+### 缓存机制
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    缓存层次                                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  [发现缓存] lodash memoize                                           │
+│  ├── getSkillDirCommands() - 文件系统 I/O 只做一次                   │
+│  ├── loadAllCommands() - 命令聚合只做一次                            │
+│  └── getSkillToolCommands() - 过滤只做一次                           │
+│                                                                      │
+│  [提取缓存] Promise memoization                                      │
+│  └── extractionPromise ??= extractBundledSkillFiles()               │
+│      // Bundled 技能的参考文件只提取一次                             │
+│                                                                      │
+│  [懒加载] 动态 import                                                │
+│  └── 在 getPromptForCommand 内部 import('./heavyContent.js')        │
+│      // 重型内容只在调用时加载                                       │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 深度解析：LLM 调用 Skill 的格式
+
+### SkillTool 工具定义（发送给 API）
+
+```json
+{
+  "name": "Skill",
+  "description": "Execute a skill within the main conversation\n\nWhen users ask you to perform tasks, check if any of the available skills match...\n\nHow to invoke:\n- skill: \"pdf\" - invoke the pdf skill\n- skill: \"commit\", args: \"-m 'Fix bug'\" - invoke with arguments\n...",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "skill": {
+        "type": "string",
+        "description": "The skill name. E.g., \"commit\", \"review-pr\", or \"pdf\""
+      },
+      "args": {
+        "type": "string",
+        "description": "Optional arguments for the skill"
+      }
+    },
+    "required": ["skill"]
+  }
+}
+```
+
+### LLM 输出的 tool_use 块格式
+
+**完整结构**：
+
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_abc123",
+  "name": "Skill",
+  "input": {
+    "skill": "commit",
+    "args": "-m 'Fix bug'"
+  }
+}
+```
+
+**流式传输过程**：
+
+```
+event: content_block_start
+data: {"index":0,"content_block":{"type":"tool_use","id":"toolu_abc123","name":"Skill"}}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"skill\":"}}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"\"commit\""}}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"input_json_delta","partial_json":",\"args\":\"-m 'Fix bug'\"}"}}
+
+event: content_block_stop
+data: {"index":0}
+```
+
+### Tool Result 返回格式
+
+**Inline 技能**（默认）：
+
+```json
+{
+  "type": "tool_result",
+  "tool_use_id": "toolu_abc123",
+  "content": "Launching skill: commit"
+}
+```
+
+随后技能内容作为新消息注入对话。
+
+**Forked 技能**（独立 Agent 执行）：
+
+```json
+{
+  "type": "tool_result",
+  "tool_use_id": "toolu_abc123",
+  "content": "Skill \"heavy-analysis\" completed (forked execution).\n\nResult:\n[分析结果...]"
+}
+```
+
+### 调用示例对照
+
+| 用户输入 | LLM 输出的 tool_use |
+|---------|-------------------|
+| `/commit` | `{skill: "commit"}` |
+| `/commit -m "fix bug"` | `{skill: "commit", args: "-m \"fix bug\""}` |
+| `/review-pr 123` | `{skill: "review-pr", args: "123"}` |
+| `/ms-office-suite:pdf` | `{skill: "ms-office-suite:pdf"}` |
+
+---
+
 ## 关键代码解读
 
 ### 1. 技能加载器 getSkillDirCommands
@@ -662,9 +1048,20 @@ Claude Code 的 Skills 系统是一个独立的 prompt 模板命令系统：
 | **懒加载** | Promise 缓存 | 性能优化 |
 
 **核心架构洞察**：
-- Skills 是独立的 prompt 模板系统，有自己的架构
-- Agent 通过 SkillTool（一个 Tool）调用 Skills 系统
-- Skills 的 prompt 内容调用时展开到对话中
-- Skills 和 CLI Commands 共享 Command 类型（统一抽象）
+
+1. **系统提示词注入**：
+   - 通过 `skill_listing` attachment 将技能列表注入 `<system-reminder>`
+   - 首次注入全部，后续只注入新增（delta）
+   - 预算限制 1% context window
+
+2. **内容加载时机**：
+   - 文件技能：发现时读取内容，调用时执行 Shell 命令
+   - Bundled 重型：调用时动态 import，整个模块懒加载
+   - 缓存层次：memoize（发现）+ Promise memoization（提取）+ 动态 import（调用）
+
+3. **LLM 调用格式**：
+   - SkillTool 作为单一工具发送给 API
+   - LLM 输出 `{type: "tool_use", name: "Skill", input: {skill, args}}`
+   - 流式传输 JSON 片段，累积后解析执行
 
 这个设计让用户可以通过简单的 Markdown 文件扩展 Claude 的能力，形成丰富的技能生态系统。
