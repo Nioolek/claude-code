@@ -392,32 +392,187 @@ const ctx = createSubagentContext(parentContext, {
 
 ### 2.4 Mailbox 消息传递
 
+Mailbox 是多代理系统的"通信枢纽"，让不同代理之间可以传递消息。系统实现了两种层次的 Mailbox：
+
+#### 两种实现层次
+
+| 层次 | 文件 | 适用场景 | 存储位置 |
+|------|------|----------|----------|
+| **内存级** | `src/utils/mailbox.ts` | 同进程内代理通信 | 内存队列 |
+| **文件级** | `src/utils/teammateMailbox.ts` | 跨进程代理通信 | `~/.claude/teams/{team}/inboxes/{agent}.json` |
+
+#### 内存级 Mailbox（进程内）
+
 ```typescript
 export class Mailbox {
-  private queue: Message[] = []
-  private waiters: Waiter[] = []
+  private queue: Message[] = []      // 消息队列
+  private waiters: Waiter[] = []     // 等待者列表（异步接收）
 
   send(msg: Message): void {
+    // 先检查有没有人在等这条消息
     const idx = this.waiters.findIndex(w => w.fn(msg))
     if (idx !== -1) {
       const waiter = this.waiters.splice(idx, 1)[0]
-      waiter.resolve(msg)
+      waiter.resolve(msg)  // 直接交给等待者
       return
     }
-    this.queue.push(msg)
+    this.queue.push(msg)  // 没人等，放入队列
   }
 
   receive(fn: (msg: Message) => boolean): Promise<Message> {
+    // 先检查队列里有没有匹配的消息
     const idx = this.queue.findIndex(fn)
     if (idx !== -1) {
       return Promise.resolve(this.queue.splice(idx, 1)[0])
     }
+    // 队列里没有，注册等待者
     return new Promise(resolve => {
       this.waiters.push({ fn, resolve })
     })
   }
 }
 ```
+
+**通俗类比**：像一个**公司内部信箱**
+- `send`：投递信件到信箱，如果有人在等这封信，直接交给他
+- `receive`：去信箱取信，如果没有想要的信，就留下来等
+
+**设计亮点**：
+- **条件接收**：`receive(fn)` 接受一个过滤函数，只接收符合条件的消息
+- **即时交付**：如果接收者正在等待，消息直接传递，不经过队列
+- **Signal 订阅**：支持 `subscribe` 订阅变化，UI 可以响应式更新
+
+#### 文件级 Mailbox（跨进程）
+
+当代理运行在不同进程（如 tmux pane）时，内存队列无法共享，需要文件系统作为中转站。
+
+**存储路径**：
+```
+~/.claude/teams/{team_name}/inboxes/{agent_name}.json
+```
+
+**消息结构**：
+```typescript
+type TeammateMessage = {
+  from: string        // 发送者名称
+  text: string        // 消息内容（JSON 序列化的结构化消息）
+  timestamp: string   // 时间戳
+  read: boolean       // 是否已读
+  color?: string      // 发送者颜色（UI 显示）
+  summary?: string    // 消息摘要预览
+}
+```
+
+**写入流程**（带文件锁）：
+```
+1. 确保收件箱目录存在
+2. 创建 .lock 文件获取锁
+3. 读取现有消息列表
+4. 追加新消息
+5. 写回文件
+6. 释放锁
+```
+
+**通俗类比**：像一个**邮局**
+- 每个代理有自己的"信箱"（收件箱文件）
+- 其他代理往这个信箱投递信件
+- 代理定期检查信箱，取出新信件
+
+#### 支持的消息类型
+
+| 消息类型 | 方向 | 用途 |
+|----------|------|------|
+| `idle_notification` | Worker → Leader | Worker 完成任务，进入空闲状态 |
+| `permission_request` | Worker → Leader | 请求权限审批（工具调用） |
+| `permission_response` | Leader → Worker | 返回权限审批结果 |
+| `sandbox_permission_request` | Worker → Leader | 请求沙箱网络访问权限 |
+| `sandbox_permission_response` | Leader → Worker | 返回沙箱权限审批结果 |
+| `shutdown_request` | Leader → Worker | 请求 Worker 关机 |
+| `shutdown_approved/rejected` | Worker → Leader | Worker 接受/拒绝关机 |
+| `task_assignment` | Leader → Worker | 分配任务给 Worker |
+| `plan_approval_request` | Worker → Leader | 请求计划审批 |
+| `plan_approval_response` | Leader → Worker | 返回计划审批结果 |
+| `mode_set_request` | Leader → Worker | 设置 Worker 的权限模式 |
+| `team_permission_update` | Leader → Worker | 更新团队权限规则 |
+
+#### 权限请求冒泡流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Worker Agent                            │
+│  遇到权限提示 → shouldAvoidPermissionPrompts=true            │
+│  无法显示 UI → 需要"冒泡"给 Leader                            │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+          ┌───────────────────────┐
+          │ permission_request    │
+          │ {toolName, input,     │
+          │  description, ...}    │
+          └───────────┬───────────┘
+                      │ writeToMailbox(leaderName, ...)
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Leader Agent                            │
+│  轮询收件箱 → 发现 permission_request                         │
+│  显示权限对话框 → 用户批准/拒绝                               │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+          ┌───────────────────────┐
+          │ permission_response   │
+          │ {decision, feedback,  │
+          │  permissionUpdates}   │
+          └───────────┬───────────┘
+                      │ writeToMailbox(workerName, ...)
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Worker Agent                            │
+│  轮询收件箱 → 发现 permission_response                       │
+│  根据结果继续/中止工具执行                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键代码**（`src/utils/swarm/permissionSync.ts`）：
+```typescript
+// Worker 发送权限请求
+export async function sendPermissionRequestViaMailbox(
+  request: SwarmPermissionRequest,
+): Promise<boolean> {
+  const leaderName = await getLeaderName(request.teamName)
+  const message = createPermissionRequestMessage({...})
+  await writeToMailbox(leaderName, {...}, request.teamName)
+}
+
+// Leader 发送权限响应
+export async function sendPermissionResponseViaMailbox(
+  workerName: string,
+  resolution: PermissionResolution,
+  requestId: string,
+): Promise<boolean> {
+  const message = createPermissionResponseMessage({...})
+  await writeToMailbox(workerName, {...}, teamName)
+}
+```
+
+#### 结构化消息识别
+
+系统通过 `isStructuredProtocolMessage()` 区分"给 LLM 看的消息"和"需要路由处理的消息"：
+
+```typescript
+export function isStructuredProtocolMessage(messageText: string): boolean {
+  // 这些消息类型有专门的处理函数，不应作为原始文本注入 LLM
+  return (
+    type === 'permission_request' ||
+    type === 'permission_response' ||
+    type === 'sandbox_permission_request' ||
+    type === 'shutdown_request' ||
+    // ... 其他协议消息
+  )
+}
+```
+
+**设计意图**：协议消息走专门的队列处理器，普通消息（如 Worker 的研究发现）作为上下文注入 LLM。
 
 ### 2.5 Swarm 后端实现
 
