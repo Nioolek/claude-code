@@ -1625,7 +1625,611 @@ if (streamingToolExecutor) {
 
 ---
 
-## 13. 整体架构总结
+## 13. Agent 调度链深挖：从 AgentTool 到 runAgent 再到 query
+
+### 13.1 总体调用链长什么样
+
+从 `AgentTool.tsx` 与 `runAgent.ts` 看，主链路可以抽象为：
+
+```
+1. 主模型决定调用 Agent 工具
+2. AgentTool.call() 解析输入
+3. 解析是否 teammate / fork / built-in / background / worktree / remote
+4. 选择 agent definition
+5. 构造 prompt messages
+6. 构造 / 继承 system prompt
+7. 组装工具池
+8. 创建 agent-specific ToolUseContext
+9. 注册 hooks / skills / MCP servers
+10. 调用 runAgent()
+11. runAgent() 内部再调用 query()
+12. query 产出消息流
+13. runAgent 记录 transcript、处理 lifecycle、清理资源
+14. AgentTool 汇总结果或走异步任务通知
+```
+
+这已经是一条非常完整的 **subagent runtime pipeline**。
+
+---
+
+### 13.2 核心源码文件
+
+| 文件 | 职责 | 行数 |
+|------|------|------|
+| `src/tools/AgentTool/AgentTool.tsx` | Agent 工具入口，参数解析，类型路由 | ~1400 行 |
+| `src/tools/AgentTool/runAgent.ts` | Agent 运行时，上下文构造，调用 query | ~974 行 |
+| `src/tools/AgentTool/prompt.ts` | Agent 系统提示词构建 | ~288 行 |
+| `src/tools/AgentTool/constants.ts` | Agent 常量定义 | - |
+| `src/tools/AgentTool/loadAgentsDir.ts` | Agent 定义加载 | - |
+| `src/tools/AgentTool/forkSubagent.ts` | Fork 子 Agent 特性开关 | - |
+
+---
+
+### 13.3 为什么要检查 teammate/fork/built-in 等类型
+
+**核心原因**：不同类型的 Agent 有**完全不同的运行时行为、资源隔离级别和生命周期管理方式**。
+
+#### 5 个维度的差异
+
+| 维度 | teammate | fork | built-in | background | worktree |
+|------|----------|------|----------|------------|----------|
+| **上下文继承** | 共享团队上下文 | 完整复制父上下文 | 独立系统提示 | 独立 | 独立 + git 隔离 |
+| **生命周期** | 与团队 leader 绑定 | 独立任务 | 独立任务 | 后台运行 | 独立 + worktree 清理 |
+| **UI 展示** | 团队分屏 | 任务通知 | 任务通知 | 后台提示 | 任务通知 |
+| **权限模式** | 继承团队 | 可自定义 | 可自定义 | 自动避免 prompt | 可自定义 |
+| **资源清理** | leader 退出时清理 | 任务完成清理 | 任务完成清理 | 后台清理 | worktree 额外清理 |
+
+---
+
+### 13.4 各类型检查逻辑详解
+
+#### 检查 1: teammate（团队成员）
+
+**位置**: `AgentTool.tsx:265-280`
+
+```typescript
+// 检查 1: 是否有 Agent Teams 权限
+if (team_name && !isAgentSwarmsEnabled()) {
+  throw new Error('Agent Teams is not yet available on your plan.')
+}
+
+// 检查 2: teammate 不能嵌套 spawn teammate（团队 roster 是扁平的）
+if (isTeammate() && teamName && name) {
+  throw new Error(
+    'Teammates cannot spawn other teammates — the team roster is flat. ' +
+    'To spawn a subagent instead, omit the `name` parameter.'
+  )
+}
+
+// 检查 3: in-process teammate 不能 spawn 后台 Agent（生命周期绑定 leader 进程）
+if (isInProcessTeammate() && teamName && run_in_background === true) {
+  throw new Error(
+    'In-process teammates cannot spawn background agents. ' +
+    'Use run_in_background=false for synchronous subagents.'
+  )
+}
+```
+
+**为什么需要这些检查**：
+
+| 检查 | 原因 |
+|------|------|
+| Teams 权限 | 付费功能，需要 gating |
+| 禁止嵌套 teammate | 团队 roster 是扁平数组，嵌套会丢失 provenance |
+| in-process 不能后台 | 生命周期与 leader 进程绑定，leader 退出时 teammate 也会死 |
+
+**teammate 的运行时**：
+```typescript
+// 调用 spawnTeammate()
+const result = await spawnTeammate({
+  name,
+  team_name: teamName,
+  use_splitpane: true,  // ← UI 分屏展示
+  plan_mode_required: spawnMode === 'plan',
+}, toolUseContext)
+
+// 返回结果
+return {
+  data: {
+    status: 'teammate_spawned',
+    teammateId: result.data.agentId,
+  }
+}
+```
+
+---
+
+#### 检查 2: fork（复制自己）
+
+**位置**: `AgentTool.tsx:325-360`
+
+```typescript
+// 判断是否是 fork 路径
+const effectiveType = subagent_type ?? (isForkSubagentEnabled() ? undefined : GENERAL_PURPOSE_AGENT.agentType)
+const isForkPath = effectiveType === undefined
+
+// fork 路径的特殊处理
+if (isForkPath) {
+  // 递归 fork 防护：fork 子 Agent 不能再 fork（防止无限递归）
+  if (
+    toolUseContext.options.querySource === `agent:builtin:${FORK_AGENT.agentType}` ||
+    isInForkChild(toolUseContext.messages)
+  ) {
+    throw new Error('Fork is not available inside a forked worker. Complete your task directly using your tools.')
+  }
+  selectedAgent = FORK_AGENT
+}
+```
+
+**为什么需要这些检查**：
+
+| 检查 | 原因 |
+|------|------|
+| 递归 fork 防护 | 防止 A fork B, B fork C, C fork D... 无限递归，资源爆炸 |
+| querySource 检查 | `querySource` 是 compaction-resistant 的（不会被压缩改写），可靠追踪来源 |
+| messages 扫描 fallback | 防止 querySource 没被正确传递的情况 |
+
+**fork 的运行时**：
+```typescript
+// 使用 FORK_AGENT 定义
+selectedAgent = FORK_AGENT
+
+// 完整继承父 Agent 的上下文
+const agentToolUseContext = createSubagentContext(toolUseContext, {
+  messages: initialMessages,  // ← 继承完整对话历史
+  readFileState: agentReadFileState,  // ← 继承文件状态缓存
+  shareSetAppState: !isAsync,
+})
+```
+
+---
+
+#### 检查 3: built-in Agent
+
+**位置**: `AgentTool.tsx:360-400`
+
+```typescript
+// 根据 allowedAgentTypes 过滤 Agent
+const agents = filterDeniedAgents(
+  allowedAgentTypes 
+    ? allAgents.filter(a => allowedAgentTypes.includes(a.agentType))
+    : allAgents,
+  appState.toolPermissionContext,
+  AGENT_TOOL_NAME
+)
+
+const found = agents.find(agent => agent.agentType === effectiveType)
+if (!found) {
+  // 检查 Agent 是否存在但被权限规则拒绝
+  const agentExistsButDenied = allAgents.find(agent => agent.agentType === effectiveType)
+  if (agentExistsButDenied) {
+    const denyRule = getDenyRuleForAgent(...)
+    throw new Error(`Agent '${effectiveType}' is denied by permission rule: ${denyRule}`)
+  }
+  throw new Error(`Agent '${effectiveType}' not found`)
+}
+```
+
+**为什么需要这些检查**：
+
+| 检查 | 原因 |
+|------|------|
+| allowedAgentTypes 过滤 | 支持 `Agent(x,y,z)` 语法，只允许调用指定的 Agent |
+| 权限规则检查 | 用户可能通过 `.claude/settings.json` 拒绝某些 Agent |
+| 存在性检查 | 防止模型幻觉出不存在的 Agent 类型 |
+
+---
+
+#### 检查 4: background（后台 Agent）
+
+**位置**: `AgentTool.tsx:570-600`
+
+```typescript
+// 判断是否应该异步运行
+const forceAsync = isForkSubagentEnabled()
+const assistantForceAsync = feature('KAIROS') ? appState.kairosEnabled : false
+const shouldRunAsync = (
+  run_in_background === true ||
+  selectedAgent.background === true ||
+  isCoordinator ||
+  forceAsync ||
+  assistantForceAsync ||
+  (proactiveModule?.isProactiveActive() ?? false)
+) && !isBackgroundTasksDisabled
+```
+
+**为什么需要这些检查**：
+
+| 检查 | 原因 |
+|------|------|
+| `run_in_background` | 用户显式要求后台运行 |
+| `selectedAgent.background` | Agent 定义中声明自己应该后台运行 |
+| `isCoordinator` | Coordinator 模式下所有 Agent 必须异步（避免阻塞主循环） |
+| `forceAsync` | fork 实验强制所有 Agent 异步（统一 `<task-notification>` 交互模型） |
+| `assistantForceAsync` | Assistant 模式下强制异步（防止输入队列堵塞） |
+
+**background 的运行时**：
+```typescript
+// 注册后台任务
+const agentBackgroundTask = registerAsyncAgentTask({
+  agentId: asyncAgentId,
+  abortController: new AbortController(),
+})
+
+// 后台执行，立即返回
+void runWithAgentContext(asyncAgentContext, () => {
+  runAsyncAgentLifecycle({...})  // ← 不阻塞主循环
+})
+
+// 立即返回任务 ID
+return {
+  data: {
+    status: 'async_launched',
+    agentId: agentBackgroundTask.agentId,
+    outputFile: getTaskOutputPath(agentBackgroundTask.agentId),
+  }
+}
+```
+
+---
+
+#### 检查 5: worktree（git 隔离）
+
+**位置**: `AgentTool.tsx:590-610`
+
+```typescript
+// 设置 worktree 隔离
+if (effectiveIsolation === 'worktree') {
+  const slug = `agent-${earlyAgentId.slice(0, 8)}`
+  worktreeInfo = await createAgentWorktree(slug)
+}
+
+// fork + worktree: 注入路径转换通知
+if (isForkPath && worktreeInfo) {
+  promptMessages.push(createUserMessage({
+    content: buildWorktreeNotice(getCwd(), worktreeInfo.worktreePath)
+  }))
+}
+```
+
+**为什么需要这些检查**：
+
+| 检查 | 原因 |
+|------|------|
+| worktree 创建 | git worktree 隔离，子 Agent 的修改不影响主工作区 |
+| 路径转换通知 | 告诉子 Agent 它在 worktree 中运行，文件路径需要转换 |
+
+---
+
+### 13.5 完整调用链详解
+
+#### 步骤 1-2: AgentTool.call() 解析输入
+
+**文件**: `src/tools/AgentTool/AgentTool.tsx:240-280`
+
+```typescript
+async function call({
+  prompt,
+  subagent_type,
+  name,
+  description,
+  model,
+  run_in_background,
+  isolation,
+  // ...
+}: AgentToolInput, toolUseContext, canUseTool, assistantMessage, onProgress?) {
+  
+  // 1. 解析输入参数
+  // 2. 检查是否是 teammate / fork / built-in 等类型
+  // 3. 选择 agent definition
+}
+```
+
+---
+
+#### 步骤 3-4: 选择 Agent Definition
+
+**文件**: `src/tools/AgentTool/AgentTool.tsx:325-400`
+
+```typescript
+// 根据 subagent_type 选择具体的 Agent 定义
+const selectedAgent = agentDefinitions.find(
+  a => a.agentType === subagent_type
+)
+
+// 支持的 Agent 类型：
+// - built-in: 内置 Agent（如 code-reviewer, test-runner）
+// - fork:  fork 自己（继承完整上下文）
+// - teammate: 团队成员 Agent
+// - background: 后台运行 Agent
+// - worktree: git worktree 隔离 Agent
+// - remote: 远程 CCR 环境 Agent
+```
+
+---
+
+#### 步骤 5: 构造 prompt messages
+
+**文件**: `src/tools/AgentTool/runAgent.ts:300-400`
+
+```typescript
+// 基础系统上下文
+const baseSystemContext = {
+  cwd: getCwd(),
+  os: getOS(),
+  // ...
+}
+
+// 根据 Agent 类型调整系统上下文
+const resolvedSystemContext =
+  agentDefinition.agentType === 'Explore' ||
+  agentDefinition.agentType === 'Plan'
+    ? systemContextNoGit  // Explore/Plan 不需要 git 状态
+    : baseSystemContext
+```
+
+---
+
+#### 步骤 6: 构造 system prompt
+
+**文件**: `src/tools/AgentTool/runAgent.ts:650-700`
+
+```typescript
+// 构建 Agent 专属的 system prompt
+const agentSystemPrompt = asSystemPrompt([
+  await getSystemPrompt(
+    workerTools,
+    agentDefinition.agentType,
+    // ...
+  ),
+  // 可选的额外系统提示
+  agentDefinition.systemPrompt,
+].filter(Boolean))
+```
+
+---
+
+#### 步骤 7: 组装工具池
+
+**文件**: `src/tools/AgentTool/AgentTool.tsx:570-580`
+
+```typescript
+// 为子 Agent 组装独立的工具池
+const workerPermissionContext = {
+  ...appState.toolPermissionContext,
+  mode: selectedAgent.permissionMode ?? 'acceptEdits'
+}
+const workerTools = assembleToolPool(workerPermissionContext, appState.mcp.tools)
+```
+
+**关键点**：子 Agent 的工具池独立于父 Agent，有自己的权限模式。
+
+---
+
+#### 步骤 8: 创建 ToolUseContext
+
+**文件**: `src/tools/AgentTool/runAgent.ts:700-750`
+
+```typescript
+const agentToolUseContext = createSubagentContext(toolUseContext, {
+  options: agentOptions,
+  agentId,
+  agentType: agentDefinition.agentType,
+  messages: initialMessages,
+  readFileState: agentReadFileState,
+  abortController: agentAbortController,
+  getAppState: agentGetAppState,
+  shareSetAppState: !isAsync,  // 同步 Agent 共享状态
+  shareSetResponseLength: true,
+})
+```
+
+---
+
+#### 步骤 9: 注册 hooks/skills/MCP
+
+**文件**: `src/tools/AgentTool/runAgent.ts:550-630`
+
+```typescript
+// 注册 Agent 的 frontmatter hooks
+if (agentDefinition.hooks && hooksAllowedForThisAgent) {
+  registerFrontmatterHooks(
+    rootSetAppState,
+    agentId,
+    agentDefinition.hooks,
+    `agent '${agentDefinition.agentType}'`,
+    true, // isAgent - converts Stop to SubagentStop
+  )
+}
+
+// 预加载 skills
+const skillsToPreload = agentDefinition.skills ?? []
+```
+
+---
+
+#### 步骤 10: 调用 runAgent()
+
+**文件**: `src/tools/AgentTool/AgentTool.tsx:609-650`
+
+```typescript
+const runAgentParams: Parameters<typeof runAgent>[0] = {
+  agentDefinition: selectedAgent,
+  promptMessages,
+  toolUseContext,
+  canUseTool,
+  isAsync: shouldRunAsync,
+  querySource: toolUseContext.options.querySource ?? 'repl',
+  // ...
+}
+
+// 同步执行
+const agentIterator = runAgent({
+  ...runAgentParams,
+  override: {
+    agentId: syncAgentId,
+  },
+})[Symbol.asyncIterator]()
+```
+
+---
+
+#### 步骤 11: runAgent() 调用 query()
+
+**文件**: `src/tools/AgentTool/runAgent.ts:780-800`
+
+```typescript
+for await (const message of query({
+  messages: initialMessages,
+  systemPrompt: agentSystemPrompt,
+  userContext: resolvedUserContext,
+  systemContext: resolvedSystemContext,
+  canUseTool,
+  toolUseContext: agentToolUseContext,
+  querySource,
+  maxTurns: maxTurns ?? agentDefinition.maxTurns,
+})) {
+  // 处理返回的消息流
+  // 记录 transcript
+  // 处理 lifecycle
+  // 清理资源
+}
+```
+
+---
+
+#### 步骤 12-14: 处理结果并返回
+
+**同步 Agent**：
+```typescript
+// 等待迭代完成
+while (true) {
+  const result = await agentIterator.next()
+  if (result.done) break
+  // 处理消息
+}
+return { data: { status: 'completed', ... } }
+```
+
+**异步 Agent**：
+```typescript
+// 注册后台任务
+const agentBackgroundTask = registerAsyncAgentTask({...})
+
+// 后台执行，立即返回
+void runWithAgentContext(asyncAgentContext, () => {
+  runAsyncAgentLifecycle({...})
+})
+
+return {
+  data: {
+    status: 'async_launched',
+    agentId: agentBackgroundTask.agentId,
+    outputFile: getTaskOutputPath(agentBackgroundTask.agentId),
+  }
+}
+```
+
+---
+
+### 13.6 完整调用链时序图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 主模型决定调用 Agent 工具                                        │
+│    AgentTool({ subagent_type: "code-reviewer", prompt: "..." }) │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. AgentTool.call() (AgentTool.tsx:240)                          │
+│    - 解析输入参数                                                 │
+│    - 检查 teammate/fork/built-in/background/worktree/remote      │
+│    - 选择 agent definition                                        │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. 构造 prompt messages (runAgent.ts:300)                        │
+│    - 系统上下文                                                   │
+│    - 用户上下文                                                   │
+│    - 初始消息                                                     │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. 构造 system prompt (runAgent.ts:650)                          │
+│    - getSystemPrompt()                                           │
+│    - 增强环境细节                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. 组装工具池 (AgentTool.tsx:570)                                │
+│    - assembleToolPool(workerPermissionContext)                  │
+│    - 独立的权限模式                                               │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. 创建 ToolUseContext (runAgent.ts:700)                         │
+│    - createSubagentContext()                                     │
+│    - 继承/隔离父上下文                                             │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 7. 注册 hooks/skills/MCP (runAgent.ts:550)                       │
+│    - registerFrontmatterHooks()                                  │
+│    - 预加载 skills                                                │
+│    - 连接 MCP servers                                             │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 8. 调用 runAgent() (AgentTool.tsx:609)                           │
+│    - 同步：直接迭代                                               │
+│    - 异步：registerAsyncAgentTask() + 后台执行                    │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 9. runAgent() 调用 query() (runAgent.ts:780)                     │
+│    - query(messages, systemPrompt, ...)                         │
+│    - 流式执行 LLM 循环                                             │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 10. query() 产出消息流                                            │
+│     - 调用模型 API                                                 │
+│     - 流式接收响应                                                 │
+│     - 执行工具调用                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 11. runAgent 处理结果                                             │
+│     - 记录 transcript                                             │
+│     - 处理 lifecycle 事件                                         │
+│     - 清理资源 (MCP/worktree/abortController)                     │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 12. AgentTool 返回结果                                            │
+│     - 同步：{ status: 'completed', result: ... }                 │
+│     - 异步：{ status: 'async_launched', agentId: ... }           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 13.7 总结：为什么需要检查类型
+
+| 原因 | 说明 |
+|------|------|
+| **1. 路由到不同的执行路径** | teammate → `spawnTeammate()`, fork → `FORK_AGENT`, etc. |
+| **2. 防止非法操作** | 嵌套 teammate、递归 fork、in-process 后台运行 |
+| **3. 权限控制** | Teams 权限、Agent 拒绝规则、allowedAgentTypes |
+| **4. 资源管理** | 生命周期绑定、worktree 清理、后台任务注册 |
+| **5. UI 展示差异** | teammate 分屏、background 任务通知、fork 任务通知 |
+| **6. 上下文隔离级别** | fork 完整继承、built-in 独立、worktree git 隔离 |
+
+**核心思想**：不同类型的 Agent 本质上是**不同的运行时模式**，需要在调用前明确区分，才能正确配置上下文、权限、生命周期和 UI 展示。
+
+---
+
+## 14. 整体架构总结
 
 ### 架构图
 
