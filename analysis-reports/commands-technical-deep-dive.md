@@ -280,6 +280,7 @@ export async function clearConversation(context: CommandContext) {
 ```
 
 **与 `/compact` 的区别：**
+
 | 命令 | 保留摘要 | 保留最近消息 | 调用 LLM |
 |------|---------|-------------|----------|
 | `/clear` | ❌ | ❌ | ❌ |
@@ -348,6 +349,7 @@ function MemoryCommand({ onDone }: { onDone: (result?: string) => void }) {
 ```
 
 **记忆文件类型：**
+
 | 文件 | 路径 | 用途 |
 |------|------|------|
 | `MEMORY.md` | `~/.claude/memory/MEMORY.md` | 长期记忆 |
@@ -760,6 +762,7 @@ const ultrareview: Command = {
 ```
 
 **与 `/review` 的区别：**
+
 | 特性 | `/review` | `/ultrareview` |
 |------|-----------|----------------|
 | 类型 | `prompt` | `local-jsx` |
