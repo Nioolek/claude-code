@@ -1,0 +1,2 @@
+# Python dependencies - install with: pip install -r requirements.txt
+# Always install into the .venv virtual environment (Python 3.13)

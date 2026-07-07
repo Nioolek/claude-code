@@ -1,0 +1,17 @@
+model_list:
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: https://api.openai.com/v1
+
+  - model_name: claude-opus-4-20250514
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: https://api.openai.com/v1
+
+general_settings:
+  master_key: sk-1234  # 本地使用，任意设置
+
+```

@@ -37,6 +37,16 @@ Intercepts every tool invocation with modes: `default`, `plan`, `bypassPermissio
 ### Feature Flags
 Bun's `bun:bundle` feature() for compile-time dead code elimination. Flags include: `PROACTIVE`, `KAIROS`, `BRIDGE_MODE`, `DAEMON`, `VOICE_MODE`, `COORDINATOR_MODE`.
 
+## Python 开发环境
+
+- **Python 版本**: 3.13.7
+- **虚拟环境路径**: `.venv/`（项目根目录）
+- **激活方式**: `source .venv/Scripts/activate`（Windows Git Bash）或 `.venv\Scripts\activate`（CMD）
+- **所有 Python 开发必须在此虚拟环境中进行**，包括：
+  - 运行 Python 脚本：使用 `.venv/Scripts/python.exe` 或先激活环境再运行
+  - 安装依赖：先激活环境，再使用 `pip install`
+  - 新安装的包会记录到 `requirements.txt`
+
 ## Tech Stack
 
 - **Runtime**: Bun (uses `bun:bundle` for feature flags)
