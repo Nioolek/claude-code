@@ -106,10 +106,23 @@ def strip_markdown(text):
     return text
 
 
-def _font_name(kind='body'):
-    """Return the correct font name based on availability."""
+def _has_cjk(text: str) -> bool:
+    """Check if text contains CJK (Chinese/Japanese/Korean) characters."""
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f':
+            return True
+    return False
+
+def _font_name(kind='body', text=None):
+    """
+    Return the correct font name based on availability.
+    If text contains CJK characters, use the Chinese font instead of
+    a western-only font (e.g. Consolas in code blocks).
+    """
     if not FONT_READY:
         return {'body': 'Helvetica', 'bold': 'Helvetica-Bold', 'mono': 'Courier', 'heading_bold': 'Helvetica-Bold'}[kind]
+    if kind == 'mono' and text is not None and _has_cjk(text):
+        return CHINESE_FONT  # fall back to msyh for CJK content
     return {
         'body': CHINESE_FONT,
         'bold': FONT_BOLD,
@@ -214,10 +227,16 @@ def parse_markdown(md_path):
             text = '\n'.join(code_buf)
             code_buf = []
             if text.strip():
-                # For ASCII diagrams inside code blocks, use the mono font
+                # Pick font: Consolas for pure ASCII, Chinese font for CJK content
+                font_code = _font_name('mono', text)
+                style_code = ParagraphStyle('Code', fontName=font_code, fontSize=7.5,
+                    leading=10, textColor=HexColor('#333333'),
+                    backColor=HexColor('#F2F2F2'),
+                    spaceAfter=2, spaceBefore=1,
+                    leftIndent=6, wordWrap='CJK')
                 elements.append(Paragraph(
                     text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br/>'),
-                    styles['code']
+                    style_code
                 ))
 
     def _flush_table():
@@ -239,6 +258,12 @@ def parse_markdown(md_path):
                 style_name = 'table_cell_mono' if is_mono else 'table_cell'
                 if i == 0:
                     row_data.append(Paragraph(cell, styles['table_header']))
+                elif is_mono:
+                    # Use CJK-aware font if the cell contains Chinese
+                    font_cell = _font_name('mono', cell)
+                    style_cell = ParagraphStyle('TableMono', fontName=font_cell, fontSize=7.5,
+                        leading=10, textColor=HexColor('#333333'), wordWrap='CJK')
+                    row_data.append(Paragraph(cell, style_cell))
                 else:
                     row_data.append(Paragraph(cell, styles[style_name]))
             # Pad row to fill missing cells
