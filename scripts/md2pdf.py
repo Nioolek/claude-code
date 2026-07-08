@@ -28,7 +28,7 @@ FONT_MONO = 'zh_mono'
 FONT_READY = False
 
 def _register_chinese_fonts():
-    global FONT_READY
+    global FONT_READY, FONT_BOLD, FONT_MONO
     msyh_path = os.path.join(FONT_DIR, 'msyh.ttc')
     msyhbd_path = os.path.join(FONT_DIR, 'msyhbd.ttc')
     consolas_path = os.path.join(FONT_DIR, 'consola.ttf')
@@ -40,6 +40,7 @@ def _register_chinese_fonts():
         # Regular (微软雅黑)
         ttc = TTCollection(msyh_path)
         tmp = tempfile.NamedTemporaryFile(suffix='.ttf', delete=False)
+        tmp.close()
         ttc[0].save(tmp.name)
         pdfmetrics.registerFont(TTFont(CHINESE_FONT, tmp.name))
 
@@ -47,24 +48,41 @@ def _register_chinese_fonts():
         if os.path.exists(msyhbd_path):
             ttc_bd = TTCollection(msyhbd_path)
             tmp_bd = tempfile.NamedTemporaryFile(suffix='.ttf', delete=False)
+            tmp_bd.close()
             ttc_bd[0].save(tmp_bd.name)
             pdfmetrics.registerFont(TTFont(FONT_BOLD, tmp_bd.name))
         else:
             FONT_BOLD = CHINESE_FONT
 
-        # Monospace — use 微软雅黑 for code blocks too (no Courier alternative
-        # that covers CJK). If Consolas is available, use it for ASCII art;
-        # otherwise fall back to the regular Chinese font.
-        if os.path.exists(consolas_path):
-            pdfmetrics.registerFont(TTFont(FONT_MONO, consolas_path))
-        else:
+        # Monospace — prefer a CJK-capable monospace font; fall back to
+        # the Chinese font if none is found. Most Windows installs don't
+        # have a monospace CJK font by default.
+        mono_candidates = [
+            consolas_path,
+            os.path.join(FONT_DIR, 'cour.ttf'),              # Courier New
+        ]
+        mono_registered = False
+        for p in mono_candidates:
+            if os.path.exists(p):
+                try:
+                    pdfmetrics.registerFont(TTFont(FONT_MONO, p))
+                    mono_registered = True
+                    break
+                except Exception:
+                    continue
+        if not mono_registered:
             FONT_MONO = CHINESE_FONT  # msyh can at least render the Chinese parts
 
         return True
-    except Exception:
+    except Exception as e:
+        print(f'Warning: font registration failed ({e}), using Helvetica fallback', file=sys.stderr)
         return False
 
 FONT_READY = _register_chinese_fonts()
+if not FONT_READY:
+    print('Warning: Chinese font registration failed, falling back to Helvetica', file=sys.stderr)
+else:
+    print(f'Chinese fonts registered: zh={CHINESE_FONT}, bold={FONT_BOLD}, mono={FONT_MONO}', file=sys.stderr)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
