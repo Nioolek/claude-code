@@ -17,7 +17,8 @@
 8. [状态管理与 UI 渲染](#8-状态管理与-ui-渲染)
 9. [文件持久化机制](#9-文件持久化机制)
 10. [动手实践：如何使用](#10-动手实践如何使用)
-11. [关键文件索引](#11-关键文件索引)
+11. [长时间循环中的任务遗忘问题分析](#11-长时间循环中的任务遗忘问题分析)
+12. [关键文件索引](#12-关键文件索引)
 
 ---
 
@@ -913,7 +914,239 @@ TaskUpdate({ taskId: "2", status: "deleted" })
 
 ---
 
-## 11. 关键文件索引
+## 11. 长时间循环中的任务遗忘问题分析
+
+> 调研问题：在长时间任务执行中，工具调用循环过多时，大模型是否会忘记自己有哪些任务？
+
+### 11.1 问题本质
+
+Todo/Task 系统的核心矛盾在于：**任务的"维护者"和"执行者"都是 LLM 模型本身**。模型需要同时做到：
+
+1. **记住**有哪些任务待完成
+2. **执行**这些任务的具体步骤
+3. **更新**任务状态以反映进度
+
+在短会话中这不是问题——任务列表就在最近的历史中。但在**长时间执行循环**中（10+ 轮工具调用），任务信息可能被淹没在大量工具调用结果和代码输出中，甚至被上下文压缩完全清除。
+
+### 11.2 防护机制现状
+
+当前系统有三道防线防止任务被遗忘：
+
+#### 防线一：自动提醒（每 10 轮注入完整列表）
+
+**文件**: `src/utils/attachments.ts:254-257`
+
+```typescript
+export const TODO_REMINDER_CONFIG = {
+  TURNS_SINCE_WRITE: 10,     // 距上次写入 10 轮后触发
+  TURNS_BETWEEN_REMINDERS: 10, // 距上次提醒 10 轮后再触发
+} as const
+```
+
+- V1：`getTodoReminderAttachments` 注入 `todo_reminder` 附件，包含完整 `appState.todos` 列表
+- V2：`getTaskReminderAttachments` 从磁盘读取完整 `listTasks()` 结果，注入 `task_reminder` 附件
+- 提醒以 `<system-reminder>` 标签形式注入，对用户不可见（`NULL_RENDERING_TYPES`）
+
+#### 防线二：压缩提示要求保留待处理任务
+
+**文件**: `src/services/compact/prompt.ts:74`
+
+```
+7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+```
+
+三种压缩模式（BASE/PARTIAL/PARTIAL_UP_TO）都包含了这一要求。
+
+#### 防线三：系统提示中的任务说明
+
+**文件**: `src/constants/prompts.ts:307-308`
+
+```
+Break down and manage your work with the ${taskToolName} tool. These tools are helpful for
+planning your work and helping the user track your progress. Mark each task as completed
+as soon as you are done with the task. Do not batch up multiple tasks before marking them
+as completed.
+```
+
+### 11.3 工具返回结果分析——任务列表去哪了？
+
+两个核心工具的返回结果中，**都不包含当前任务列表**：
+
+#### V1 TodoWriteTool 返回结果
+
+**文件**: `src/tools/TodoWriteTool/TodoWriteTool.ts:104-114`
+
+```typescript
+mapToolResultToToolResultBlockParam({ verificationNudgeNeeded }, toolUseID) {
+    const base = `Todos have been modified successfully. Ensure that you continue to
+use the todo list to track your progress. Please proceed with the current tasks if applicable`
+    const nudge = verificationNudgeNeeded
+      ? `\n\nNOTE: You just closed out 3+ tasks and none of them was a verification step...`
+      : ''
+    return {
+      tool_use_id: toolUseID,
+      type: 'tool_result',
+      content: base + nudge,
+    }
+}
+```
+
+模型得到的是一个**静态确认字符串**，不包含任何待办事项的实际内容。模型必须靠自己的记忆来知道刚才写了什么。
+
+#### V2 TaskUpdateTool 返回结果
+
+**文件**: `src/tools/TaskUpdateTool/TaskUpdateTool.ts:364-405`
+
+```typescript
+mapToolResultToToolResultBlockParam(content, toolUseID) {
+    // ...
+    let resultContent = `Updated task #${taskId} ${updatedFields.join(', ')}`
+    // ...
+    return { tool_use_id: toolUseID, type: 'tool_result', content: resultContent }
+}
+```
+
+同样只是 `"Updated task #3 status → completed"` 这样的简短确认，**没有附带当前完整任务列表**。
+
+#### 对比分析
+
+| 维度 | 理想行为 | 当前行为 | 差距 |
+|------|---------|---------|------|
+| 写入后确认 | 返回当前完整列表 | 返回静态字符串 | 模型必须靠记忆 |
+| 更新后确认 | 返回当前完整列表 | 返回 `Updated task #N` | 模型必须靠记忆 |
+| 自动提醒 | 每 N 轮注入列表 | 每 10 轮注入 | 10 轮窗口期可能遗忘 |
+| 压缩后附件 | 重新注入完整列表 | 不注入 | 压缩后靠文本摘要 |
+
+### 11.4 上下文压缩后的"记忆断层"
+
+这是最严重的问题。当上下文窗口接近满时，自动压缩会触发。压缩后的处理逻辑是：
+
+**文件**: `src/services/compact/compact.ts:531-585`
+
+```typescript
+const [fileAttachments, asyncAgentAttachments] = await Promise.all([
+  createPostCompactFileAttachments(...),   // 重新读取最近的文件
+  createAsyncAgentAttachmentsIfNeeded(...), // 正在运行的 agent 任务状态
+])
+
+// 重新注入的附件：文件、异步 agent、计划、技能、MCP 指令...
+// ❌ 没有任何 todo_reminder 或 task_reminder 附件
+```
+
+压缩后重新注入的附件包括：
+- 最近读取的文件
+- 异步 agent 运行状态
+- 计划文件 / 计划模式状态
+- 已调用的技能
+- 延迟工具 / MCP / agent 列表
+
+**但没有任何机制重新注入 TodoWrite 的待办事项列表或 TaskCreate/TaskUpdate 的任务数据库。**
+
+这意味着：
+
+```
+压缩前（模型看到完整上下文）：
+  [系统提示] → [任务列表] → [代码] → [工具结果] → ...
+
+压缩发生后：
+  [系统提示] → [压缩摘要（含 "Pending Tasks" 文本）] → [文件附件] → ...
+
+  ⚠️ 结构化任务列表消失了！
+  ⚠️ 只剩压缩摘要中几句文本描述
+  ⚠️ 如果模型写摘要时遗漏了任务，任务就彻底丢失
+  ⚠️ 直到下次自动提醒（最多 10 轮后）才会重新出现
+```
+
+### 11.5 自动提醒的"窗口期"问题
+
+自动提醒虽然有效，但存在 **10 轮窗口期**：
+
+```
+时间线（每格 = 1 轮工具调用）：
+  │创建任务│→│工具1│→│工具2│→│...│→│工具9│→│工具10│→│提醒触发│
+  │        │  │     │  │     │  │   │  │     │  │      │  │列表注入│
+  └── 任务明确 ──┴────── 遗忘风险窗口（10 轮） ──────┴── 恢复 ──┘
+```
+
+在这个 10 轮窗口内，模型的唯一任务信息来源是：
+1. **自己的短期记忆**（注意力窗口中的原始工具调用结果）
+2. **压缩摘要中的文本**（如果发生过压缩）
+3. **系统提示中的静态说明**（只说"用任务工具"，没给列表）
+
+对于快速工具调用循环（如连续的文件读取、搜索、编辑），10 轮可能只需要 10-20 秒。但如果是长时间运行的 bash 命令或 agent 调用，10 轮可能跨越数分钟。无论如何，在这段时间内模型对任务的"认知"是完全被动的。
+
+### 11.6 差距汇总
+
+| 差距 | 严重程度 | 影响场景 |
+|------|---------|---------|
+| 工具结果不含任务列表 | **高** | 每次写入/更新后，模型立即失去结构化任务视图 |
+| 压缩后无任务列表重新注入 | **高** | 压缩后结构化任务信息丢失，仅靠文本摘要幸存 |
+| 10 轮提醒窗口期 | **中** | 在窗口期内，模型只能靠记忆 |
+| 无自动 TaskList 调用 | **中** | 系统不主动触发 TaskList，全靠模型自觉 |
+| 系统提示任务说明过于宽泛 | **低** | 只说"用任务工具"，不给当前列表 |
+
+### 11.7 改进建议
+
+针对上述差距，可以采取以下改进措施：
+
+#### 建议一：工具结果中包含任务列表
+
+在 `mapToolResultToToolResultBlockParam` 中，将当前完整任务列表附加到结果文本末尾：
+
+```typescript
+// TodoWriteTool.ts — 建议修改
+mapToolResultToToolResultBlockParam({ verificationNudgeNeeded, newTodos }, toolUseID) {
+    let base = `Todos have been modified successfully.`
+    // 附加当前完整列表
+    if (newTodos.length > 0) {
+      base += `\n\nCurrent todos:\n${newTodos.map(t =>
+        `[${t.status}] ${t.content}`
+      ).join('\n')}`
+    }
+    // ...
+}
+```
+
+这样每次写入/更新后，模型都能立即看到最新的任务列表，无需依赖记忆。
+
+#### 建议二：压缩后注入任务提醒附件
+
+在 `compact.ts` 的 `postCompactFileAttachments` 中，增加对 Todo/Task 列表的重新注入：
+
+```typescript
+// compact.ts — 建议修改
+const [fileAttachments, asyncAgentAttachments, taskAttachments] = await Promise.all([
+  createPostCompactFileAttachments(...),
+  createAsyncAgentAttachmentsIfNeeded(...),
+  createPostCompactTaskAttachments(context), // ← 新增：重新注入任务列表
+])
+```
+
+`createPostCompactTaskAttachments` 可以调用 `getTaskReminderAttachments` 或 `getTodoReminderAttachments` 来生成与自动提醒相同格式的附件。
+
+#### 建议三：缩短提醒间隔或使其自适应
+
+在快速工具调用场景中，10 轮可能很快过去，但模型也可能很快遗忘。可以考虑：
+
+- 缩短 `TURNS_BETWEEN_REMINDERS` 到 5-7 轮
+- 在检测到上下文压缩后立即触发一次提醒（而非等待 10 轮）
+- 让提醒间隔随工具调用频率自适应
+
+#### 建议四：在系统提示中加入"定期检查任务"的指令
+
+当前系统提示只说"用任务工具管理你的工作"，可以增强为：
+
+```
+Use the task tools to manage your work. Periodically (every 3-5 steps) call TaskList
+to refresh your task view and ensure no tasks are being overlooked. After context
+compaction, call TaskList to re-establish your task awareness.
+```
+
+这比固定的 10 轮提醒机制更灵活，让模型自身具备主动维护任务认知的能力。
+
+---
+
+## 12. 关键文件索引
 
 | 文件 | 用途 | 重要性 |
 |------|------|--------|
