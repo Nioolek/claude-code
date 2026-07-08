@@ -11,12 +11,13 @@
 2. [两个并存的系统：Todo V1 与 Task V2](#2-两个并存的系统todo-v1-与-task-v2)
 3. [TodoWriteTool（V1）详解](#3-todowritetoolv1详解)
 4. [Task 工具集（V2）详解](#4-task-工具集v2详解)
-5. [任务生命周期管理](#5-任务生命周期管理)
-6. [后台任务系统（Background Tasks）](#6-后台任务系统background-tasks)
-7. [状态管理与 UI 渲染](#7-状态管理与-ui-渲染)
-8. [文件持久化机制](#8-文件持久化机制)
-9. [动手实践：如何使用](#9-动手实践如何使用)
-10. [关键文件索引](#10-关键文件索引)
+5. [子智能体（Sub-agent）的 Task 工具访问权限](#5-子智能体sub-agent的-task-工具访问权限)
+6. [任务生命周期管理](#6-任务生命周期管理)
+7. [后台任务系统（Background Tasks）](#7-后台任务系统background-tasks)
+8. [状态管理与 UI 渲染](#8-状态管理与-ui-渲染)
+9. [文件持久化机制](#9-文件持久化机制)
+10. [动手实践：如何使用](#10-动手实践如何使用)
+11. [关键文件索引](#11-关键文件索引)
 
 ---
 
@@ -318,18 +319,263 @@ pending ──────→ in_progress ──────→ completed
 - 按 ID 获取完整任务详情（含 description、blocks、blockedBy，但不含 owner/activeForm/metadata）
 - 适合开始工作前获取完整上下文
 
-### 4.5 工具名常量
+## 4.5 工具提示词（Prompt）详解
+
+V2 系统中的每个工具都配有 Description 和 Prompt，用于教导 LLM 何时使用以及如何使用。这些提示词是 LLM 正确使用 Task 工具的关键。
+
+### 4.5.1 TaskCreateTool 的提示词
+
+**文件**: `src/tools/TaskCreateTool/prompt.ts`
+
+**Description**（简短描述，用于工具注册表）:
+```
+Create a new task in the task list
+```
+
+**Prompt**（完整行为指南，注入 LLM 系统提示词）:
+
+提示词包含以下关键部分：
+
+1. **使用场景**（When to Use This Tool）：
+   - 复杂多步骤任务 — 3 个或以上步骤
+   - 非平凡复杂任务 — 需要规划或多个操作
+   - Plan mode 场景
+   - 用户明确要求使用 todo list
+   - 用户列出了多个事项（编号或逗号分隔）
+   - 收到新指令后立即用 TaskCreate 记录需求
+   - 开始工作时标记为 in_progress
+   - 完成任务后标记完成并添加后续任务
+
+2. **不使用的场景**（When NOT to Use）：
+   - 单一简单任务（1 步完成）
+   - 琐碎任务（无需组织管理）
+   - 可在 3 步内完成的简单任务
+   - 纯咨询/信息性任务
+
+3. **任务字段说明**：
+   - `subject`：祈使句形式的简短标题
+   - `description`：详细描述
+   - `activeForm`（可选）：进行时态，显示在 spinner 中
+
+4. **使用技巧**：
+   - 创建清晰、具体的任务标题
+   - 创建后用 TaskUpdate 设置依赖关系
+   - 先调用 TaskList 避免创建重复任务
+
+5. **条件性内容**（通过 `isAgentSwarmsEnabled()` 控制）：
+   - 启用多智能体协作时，额外提示 "description 需包含足够细节以便其他 agent 理解和完成"
+   - 提示 "新任务状态为 pending、无 owner，使用 TaskUpdate 设置 owner 来分配任务"
+
+### 4.5.2 TaskUpdateTool 的提示词
+
+**文件**: `src/tools/TaskUpdateTool/prompt.ts`
+
+**Description**: `Update a task in the task list`
+
+**Prompt** 包含：
+
+1. **何时标记完成**：明确列出了可标记完成的情形和禁止标记的情形
+2. **删除任务**：`deleted` 状态永久删除任务
+3. **更新字段**：status, subject, description, activeForm, owner, metadata, addBlocks, addBlockedBy
+4. **状态工作流**：`pending` → `in_progress` → `completed`，`deleted` 为特殊操作
+5. **陈旧性警告**：更新前先用 TaskGet 获取最新状态
+6. **JSON 示例**：直接给出了 5 种典型用法的 JSON 代码示例
+
+### 4.5.3 TaskGetTool 的提示词
+
+**文件**: `src/tools/TaskGetTool/prompt.ts`
+
+**Description**: `Get a task by ID from the task list`
+
+**Prompt** 包含：
+- 开始工作前获取完整上下文
+- 查看任务依赖（blocks/blockedBy）
+- 被分配任务后获取完整需求
+- 返回字段：subject, description, status, blocks, blockedBy
+- 提示：取任务后先确认 blockedBy 为空再开始工作
+
+### 4.5.4 TaskListTool 的提示词
+
+**文件**: `src/tools/TaskListTool/prompt.ts`
+
+**Description**: `List all tasks in the task list`
+
+**Prompt** 包含：
+- 查看可用任务（status=pending, 无 owner, 未被阻塞）
+- 检查整体进度
+- 寻找被阻塞的任务
+- 优先按 ID 顺序处理
+- 返回字段：id, subject, status, owner, blockedBy
+
+**团队工作流**（`isAgentSwarmsEnabled()` 启用时额外注入）：
+```
+1. 完成任务后调用 TaskList 找可用工作
+2. 找 status=pending, 无 owner, empty blockedBy 的任务
+3. 优先按 ID 顺序处理
+4. 用 TaskUpdate 认领任务 (设置 owner)
+5. 如果被阻塞，先解阻塞任务或通知组长
+```
+
+## 4.6 子智能体（Sub-agent）对 Task 工具的访问权限
+
+> 详细分析见 [第 5 章](#5-子智能体sub-agent的-task-工具访问权限)。
+
+简而言之：
+- **同步（前台）子智能体** — 可以访问 Task 工具（不在禁止列表中）
+- **异步（后台）子智能体** — 不能访问 Task 工具（不在白名单中）
+- **In-process teammate** — 可以访问 Task 工具（显式列入白名单）
+- 主智能体和子智能体共享**同一个 task list**（基于 session ID）
+
+## 4.7 TaskCreate 的一次一任务 vs TodoWrite 的批量模式
+
+> 完整讨论见 [第 5.5 节](#55-8-个步骤需要-8-次-taskcreate-问题)。
+
+| 特性 | V1 TodoWriteTool | V2 TaskCreateTool |
+|------|------------------|-------------------|
+| 一次调用创建 | 批量（整个列表） | 单个任务 |
+| 更新方式 | 全量替换 | 增量更新（TaskUpdate） |
+| 调用次数 | 1 次 = 创建/更新整个列表 | 8 个任务 = 8 次 TaskCreate |
+
+---
+
+## 5. 子智能体（Sub-agent）的 Task 工具访问权限
+
+### 5.1 权限矩阵
+
+子智能体能否访问 Task 工具，取决于其**类型**和**运行方式**：
+
+| 子智能体类型 | 可访问 TaskCreate/Update/Get/List? | 原因 |
+|-------------|-----------------------------------|------|
+| **同步（前台）子智能体**（如 Explore、Plan、code-reviewer） | 是 | 不在 `ALL_AGENT_DISALLOWED_TOOLS` 中 |
+| **异步（后台）子智能体**（`run_in_background=true`） | 否 | 不在 `ASYNC_AGENT_ALLOWED_TOOLS` 中 |
+| **In-process teammate**（队友模式） | 是 | 显式列入 `IN_PROCESS_TEAMMATE_ALLOWED_TOOLS` |
+| **主线程（根）agent** | 是 | 直接使用完整工具池 |
+
+### 5.2 过滤机制图解
+
+```
+                        getAllBaseTools()
+                      (包含 TaskCreate/Update/Get/List)
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │   resolveAgentTools()  │
+                    │  (agentToolUtils.ts)   │
+                    └──────┬───────────────┘
+                           │
+                    ┌──────▼───────────────┐
+                    │  filterToolsForAgent() │
+                    └──────┬───────────────┘
+                           │
+           ┌───────────────┼───────────────────┐
+           │               │                   │
+           ▼               ▼                   ▼
+   ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐
+   │ 同步 agent    │ │ 异步 agent   │ │ In-process       │
+   │ (前台)        │ │ (后台)       │ │ teammate         │
+   ├──────────────┤ ├──────────────┤ ├──────────────────┤
+   │ TaskCreate ✓ │ │ TaskCreate ✗ │ │ TaskCreate ✓     │
+   │ TaskUpdate ✓ │ │ TaskUpdate ✗ │ │ TaskUpdate ✓     │
+   │ TaskGet ✓    │ │ TaskGet ✗    │ │ TaskGet ✓        │
+   │ TaskList ✓   │ │ TaskList ✗   │ │ TaskList ✓       │
+   └──────────────┘ └──────────────┘ └──────────────────┘
+```
+
+### 5.3 关键代码
+
+**文件**: `src/constants/tools.ts`
 
 ```typescript
-// src/tools/TaskCreateTool/constants.ts
-export const TASK_CREATE_TOOL_NAME = 'TaskCreate'
+// 所有 agent 全局禁止的工具（Task 工具不在其中 → 默认允许）
+// AGENT_TOOL_NAME 仅非 ant 用户禁止；WORKFLOW_TOOL_NAME 有 feature flag 控制
+export const ALL_AGENT_DISALLOWED_TOOLS = new Set([
+  TASK_OUTPUT_TOOL_NAME,      // 禁止
+  EXIT_PLAN_MODE_V2_TOOL_NAME, // 禁止
+  ENTER_PLAN_MODE_TOOL_NAME,   // 禁止
+  ...(process.env.USER_TYPE === 'ant' ? [] : [AGENT_TOOL_NAME]),
+  ASK_USER_QUESTION_TOOL_NAME, // 禁止
+  TASK_STOP_TOOL_NAME,         // 禁止
+  ...(feature('WORKFLOW_SCRIPTS') ? [WORKFLOW_TOOL_NAME] : []),
+])
 
-// 其他工具类似规则：TaskUpdate, TaskList, TaskGet
+// 异步 agent 白名单（Task 工具不在其中 → 禁止）
+export const ASYNC_AGENT_ALLOWED_TOOLS = new Set([
+  FILE_READ_TOOL_NAME, WEB_SEARCH_TOOL_NAME, TODO_WRITE_TOOL_NAME, ...
+])
+
+// In-process teammate 额外允许的工具
+export const IN_PROCESS_TEAMMATE_ALLOWED_TOOLS = new Set([
+  TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME,
+  TASK_LIST_TOOL_NAME, TASK_UPDATE_TOOL_NAME,
+  SEND_MESSAGE_TOOL_NAME,
+])
+```
+
+**文件**: `src/tools/AgentTool/agentToolUtils.ts`（过滤逻辑）：
+
+```typescript
+export function filterToolsForAgent({ tools, isBuiltIn, isAsync, permissionMode }) {
+  return tools.filter(tool => {
+    // MCP 工具对所有 agent 开放
+    if (tool.name.startsWith('mcp__')) return true
+    // Plan 模式下的 ExitPlanMode 绕过
+    if (toolMatchesName(tool, EXIT_PLAN_MODE_V2_TOOL_NAME) && permissionMode === 'plan') return true
+    if (ALL_AGENT_DISALLOWED_TOOLS.has(tool.name)) return false
+    if (!isBuiltIn && CUSTOM_AGENT_DISALLOWED_TOOLS.has(tool.name)) return false
+    if (isAsync && !ASYNC_AGENT_ALLOWED_TOOLS.has(tool.name)) {
+      if (isAgentSwarmsEnabled() && isInProcessTeammate()) {
+        if (IN_PROCESS_TEAMMATE_ALLOWED_TOOLS.has(tool.name)) return true
+      }
+      return false  // 异步 agent 禁止
+    }
+    return true
+  })
+}
+```
+
+### 5.4 共享同一个 Task List
+
+主智能体和子智能体共享**同一个 taskListId**，因为 `getTaskListId()` 的 fallback 是 `getSessionId()`，而子智能体通过 `createSubagentContext()` 继承父级的 session：
+
+```typescript
+// src/utils/tasks.ts:199
+export function getTaskListId(): string {
+  if (process.env.CLAUDE_CODE_TASK_LIST_ID) return ...
+  const teammateCtx = getTeammateContext()
+  if (teammateCtx) return teammateCtx.teamName  // 队友共用 leader 的 task list
+  return getTeamName() || leaderTeamName || getSessionId()
+}
+```
+
+这意味着主智能体创建的任务，前台子智能体可以看到并更新，反之亦然。这是团队协作的基础。
+
+### 5.5 "8 个步骤需要 8 次 TaskCreate" 问题
+
+**是的，需要 8 次调用**。V2 的 `TaskCreateTool` 一次调用只能创建一个任务。这与 V1 的 `TodoWriteTool` 形成鲜明对比：
+
+| 特性 | V1 TodoWriteTool | V2 TaskCreateTool |
+|------|------------------|-------------------|
+| 一次调用创建 | 批量（整个列表） | 单个任务 |
+| 更新方式 | 全量替换 | 增量更新（TaskUpdate） |
+| 8 个步骤 | 1 次 TodoWrite 调用 | 8 次 TaskCreate 调用 |
+
+**优化策略**：8 次 TaskCreate 可以**并行**发出（同一个 AI 回复中多个工具调用），因为它们没有数据依赖——每个 TaskCreate 通过文件锁独立分配 ID：
+
+```
+AI 回复中同时发出（并行）：
+  TaskCreate({subject: "步骤1", description: "..."})
+  TaskCreate({subject: "步骤2", description: "..."})
+  TaskCreate({subject: "步骤3", description: "..."})
+  ...
+
+完成后，再并行设置依赖：
+  TaskUpdate({taskId: "2", addBlockedBy: ["1"]})
+  TaskUpdate({taskId: "3", addBlockedBy: ["1"]})
 ```
 
 ---
 
-## 5. 任务生命周期管理
+## 6. 任务生命周期管理
 
 ### V2 任务的完整生命周期
 
@@ -397,7 +643,7 @@ const LOCK_OPTIONS = {
 
 ---
 
-## 6. 后台任务系统（Background Tasks）
+## 7. 后台任务系统（Background Tasks）
 
 **这是一个与 Todo/Task 不同的系统！**
 
@@ -518,7 +764,7 @@ export const MAX_TASK_OUTPUT_BYTES = 5 * 1024 * 1024 * 1024 // 5GB 上限
 
 ---
 
-## 7. 状态管理与 UI 渲染
+## 8. 状态管理与 UI 渲染
 
 ### AppState 数据结构
 
@@ -569,12 +815,12 @@ export async function call(onDone, context) {
 
 ---
 
-## 8. 文件持久化机制
+## 9. 文件持久化机制
 
 ### V2 任务的存储位置
 
 ```
-~/.claude/config/tasks/
+~/.claude/tasks/
 ├── <taskListId>/          ← 任务列表目录
 │   ├── .lock              ← 文件锁
 │   ├── .highwatermark     ← 最高 ID 记录
@@ -610,7 +856,7 @@ export async function call(onDone, context) {
 
 ---
 
-## 9. 动手实践：如何使用
+## 10. 动手实践：如何使用
 
 ### V1 TodoWriteTool 使用方式
 
@@ -667,7 +913,7 @@ TaskUpdate({ taskId: "2", status: "deleted" })
 
 ---
 
-## 10. 关键文件索引
+## 11. 关键文件索引
 
 | 文件 | 用途 | 重要性 |
 |------|------|--------|
