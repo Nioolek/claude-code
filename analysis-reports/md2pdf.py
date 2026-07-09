@@ -808,24 +808,34 @@ class MarkdownPDF(FPDF):
                 text = hm.group(2)
                 self.render_heading(level, text)
 
-                # Insert flowcharts at specific sections
+                # Insert flowcharts at specific sections (通用 + 稳定性报告)
                 if "任务生命周期" in text and level == 2:
                     self.flowchart_task_lifecycle()
                 elif "任务轮询与驱逐" in text and level == 2:
                     self.flowchart_polling_eviction()
+                elif "重试引擎" in text and level == 3:
+                    self.flowchart_api_retry()
                 elif "重试策略" in text and level == 3:
                     self.flowchart_api_retry()
+                elif "熔断器一览" in text and level == 3:
+                    self.flowchart_circuit_breaker()
                 elif "电路断路器" in text and level == 3:
                     self.flowchart_circuit_breaker()
                 elif "三层架构" in text and level == 3:
+                    self.flowchart_agent_arch()
+                elif "整体架构概览" in text and level == 2:
                     self.flowchart_agent_arch()
                 elif "工作线程的完整生命周期" in text and level == 3:
                     self.flowchart_agent_lifecycle()
                 elif "分阶段关闭流程" in text and level == 3:
                     self.flowchart_shutdown()
+                elif "优雅关闭流程" in text and level == 3:
+                    self.flowchart_shutdown()
                 elif "错误场景分类" in text and level == 3:
                     # Place after the classification text
                     pass
+                elif "友好关闭流程" in text and level == 3:
+                    self.flowchart_shutdown()
 
                 i += 1
                 continue
@@ -927,9 +937,17 @@ class MarkdownPDF(FPDF):
 
 
 def main():
-    md_path = os.path.join(os.path.dirname(__file__),
-                           "claude-code-stability-analysis.md")
-    pdf_path = md_path.replace(".md", ".pdf")
+    import sys
+    topic = sys.argv[1] if len(sys.argv) > 1 else "claude-code-stability"
+    md_filename = f"{topic}-analysis.md"
+    pdf_filename = f"{topic}-analysis.pdf"
+
+    md_path = os.path.join(os.path.dirname(__file__), md_filename)
+    pdf_path = os.path.join(os.path.dirname(__file__), pdf_filename)
+
+    if not os.path.exists(md_path):
+        print(f"Error: {md_path} not found")
+        sys.exit(1)
 
     pdf = MarkdownPDF()
     pdf.setup_fonts()
